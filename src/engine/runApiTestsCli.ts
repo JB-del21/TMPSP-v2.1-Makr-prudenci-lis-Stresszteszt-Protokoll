@@ -22,13 +22,6 @@ process.env.TMPSP_OPERATOR_KEY = 'tmpsp-operator-token-2026';
 process.env.TMPSP_ADMIN_KEY = 'tmpsp-admin-recovery-2026';
 process.env.TMPSP_HMAC_KEY = 'tmpsp-secret-hmac-key-2026';
 
-import {
-  app,
-  startupIntegrityCheck,
-  initializeFreshLedgerAndAnchor,
-  getDATA_DIR,
-} from '../../server.ts';
-
 const TEST_PORT = 3099;
 let serverInstance: http.Server;
 
@@ -90,6 +83,12 @@ interface ApiTestResult {
 }
 
 async function runApiIntegrationTests(): Promise<void> {
+  const {
+    app,
+    startupIntegrityCheck,
+    initializeFreshLedgerAndAnchor,
+  } = await import('../../server.ts');
+
   console.log('================================================================');
   console.log('TMPSP v2.1 – HTTP API ENDPOINT INTEGRÁCIÓS ÉS BIZTONSÁGI TESZTEK');
   console.log('MNB Pénzügyi Stabilitási Tanács Audithitelesítési Specifikáció');

@@ -31,16 +31,20 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3000;
 
-const isProduction = process.env.NODE_ENV === 'production';
+const allowDevKeys = process.env.NODE_ENV !== 'production' || process.env.TMPSP_ALLOW_DEV_KEYS === '1';
 
-// Hitelesítési kulcsok és titkos HMAC kulcsok (környezeti változóból, élesben kötelező)
-const OPERATOR_TOKEN = process.env.TMPSP_OPERATOR_KEY || (isProduction ? '' : 'tmpsp-operator-token-2026');
-const ADMIN_RECOVERY_KEY = process.env.TMPSP_ADMIN_KEY || (isProduction ? '' : 'tmpsp-admin-recovery-2026');
-const HMAC_SECRET = process.env.TMPSP_HMAC_KEY || (isProduction ? '' : 'tmpsp-secret-hmac-key-2026');
+// Hitelesítési kulcsok és titkos HMAC kulcsok (környezeti változóból, hiányzó kulcs esetén fail-closed leállás)
+const OPERATOR_TOKEN = process.env.TMPSP_OPERATOR_KEY || (allowDevKeys ? 'tmpsp-operator-token-2026' : '');
+const ADMIN_RECOVERY_KEY = process.env.TMPSP_ADMIN_KEY || (allowDevKeys ? 'tmpsp-admin-recovery-2026' : '');
+const HMAC_SECRET = process.env.TMPSP_HMAC_KEY || (allowDevKeys ? 'tmpsp-secret-hmac-key-2026' : '');
 
-if (isProduction && (!process.env.TMPSP_OPERATOR_KEY || !process.env.TMPSP_ADMIN_KEY || !process.env.TMPSP_HMAC_KEY)) {
-  console.error('CRITICAL CONFIGURATION ERROR: Mandatory production environment secrets TMPSP_OPERATOR_KEY, TMPSP_ADMIN_KEY, and TMPSP_HMAC_KEY must be set!');
+if (!allowDevKeys && (!process.env.TMPSP_OPERATOR_KEY || !process.env.TMPSP_ADMIN_KEY || !process.env.TMPSP_HMAC_KEY)) {
+  console.error('CRITICAL CONFIGURATION ERROR: Mandatory environment secrets TMPSP_OPERATOR_KEY, TMPSP_ADMIN_KEY, and TMPSP_HMAC_KEY must be configured! Set TMPSP_ALLOW_DEV_KEYS=1 for local development with default test keys.');
   process.exit(1);
+}
+
+if (process.env.NODE_ENV === 'test' || process.env.TRUST_PROXY === '1') {
+  app.set('trust proxy', true);
 }
 
 app.use(express.json());
@@ -493,10 +497,11 @@ app.post('/api/audit/recovery', (req, res) => {
   }
 
   // 2. IP-alapú Rate Limiter kizárólag a SIKERTELEN próbálkozásokra (DoS védelem)
+  const trustProxy = app.get('trust proxy');
   const forwarded = req.headers['x-forwarded-for'];
-  const clientIp = typeof forwarded === 'string'
+  const clientIp = trustProxy && typeof forwarded === 'string'
     ? forwarded.split(',')[0].trim()
-    : (req.ip || req.socket.remoteAddress || 'unknown-client');
+    : (req.socket?.remoteAddress || req.ip || 'unknown-client');
 
   const now = Date.now();
   const clientFailures = (failedRecoveryAttemptsMap.get(clientIp) || []).filter((t) => now - t < 15 * 60 * 1000);
