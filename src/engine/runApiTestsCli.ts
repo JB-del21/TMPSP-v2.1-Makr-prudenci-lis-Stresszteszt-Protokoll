@@ -4,6 +4,7 @@
  */
 
 import http from 'http';
+import { spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -11,16 +12,23 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const ROOT_DIR = path.resolve(__dirname, '../..');
 
 // Szigorúan elszeparált, ideiglenes teszt könyvtár létrehozása (Fix #4: az éles/dev data/ mappa védelme)
 const tmpDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-api-test-'));
 process.env.TMPSP_DATA_DIR = tmpDataDir;
 
 // Test környezeti beállítás
+// A tesztek SAJÁT, nem nyilvános kulcsokat használnak (nem a szerver fejlesztői alapkulcsait),
+// és nem támaszkodnak NODE_ENV-re vagy TMPSP_ALLOW_DEV_KEYS-re.
 process.env.NODE_ENV = 'test';
-process.env.TMPSP_OPERATOR_KEY = 'tmpsp-operator-token-2026';
-process.env.TMPSP_ADMIN_KEY = 'tmpsp-admin-recovery-2026';
-process.env.TMPSP_HMAC_KEY = 'tmpsp-secret-hmac-key-2026';
+delete process.env.TMPSP_ALLOW_DEV_KEYS;
+delete process.env.TMPSP_TRUST_PROXY;
+const TEST_OPERATOR_KEY = 'test-operator-' + Math.random().toString(36).slice(2);
+const TEST_ADMIN_KEY = 'test-admin-' + Math.random().toString(36).slice(2);
+process.env.TMPSP_OPERATOR_KEY = TEST_OPERATOR_KEY;
+process.env.TMPSP_ADMIN_KEY = TEST_ADMIN_KEY;
+process.env.TMPSP_HMAC_KEY = 'test-hmac-' + Math.random().toString(36).slice(2);
 
 const TEST_PORT = 3099;
 let serverInstance: http.Server;
@@ -122,7 +130,7 @@ async function runApiIntegrationTests(): Promise<void> {
     const resAuthValid = await makeRequest(
       'POST',
       '/api/audit',
-      { Authorization: 'Bearer tmpsp-operator-token-2026' },
+      { Authorization: 'Bearer ' + TEST_OPERATOR_KEY },
       { negyedev: '2025Q1', esemenyTipus: 'TESZT_HOZZÁFŰZÉS', kepletVerzio: 'v2.1', felelős: 'MNB PST' }
     );
     const anchorPath = path.resolve(tmpDataDir, 'trust-anchor.json');
@@ -141,7 +149,7 @@ async function runApiIntegrationTests(): Promise<void> {
     const resRecoveryOperational = await makeRequest(
       'POST',
       '/api/audit/recovery',
-      { 'X-TMPSP-Admin-Key': 'tmpsp-admin-recovery-2026' }
+      { 'X-TMPSP-Admin-Key': TEST_ADMIN_KEY }
     );
     apiResults.push({
       id: 'API-003',
@@ -172,7 +180,7 @@ async function runApiIntegrationTests(): Promise<void> {
     const resPostLocked = await makeRequest(
       'POST',
       '/api/audit',
-      { Authorization: 'Bearer tmpsp-operator-token-2026' },
+      { Authorization: 'Bearer ' + TEST_OPERATOR_KEY },
       { negyedev: '2025Q2', esemenyTipus: 'BLOKKOLT_ÍRÁS', kepletVerzio: 'v2.1', felelős: 'MNB' }
     );
     apiResults.push({
@@ -183,35 +191,98 @@ async function runApiIntegrationTests(): Promise<void> {
       kapott: `HTTP ${resPostLocked.status}, errorCode = ${resPostLocked.body?.errorCode}`,
     });
 
-    // 6. API-006: DoS-Biztos Rate Limiting hibás próbálkozásoknál
-    // Simulating attacker IP 192.168.1.100 sending 3 bad admin keys
-    const attackerHeaders = { 'X-Forwarded-For': '192.168.1.100', 'X-TMPSP-Admin-Key': 'BAD-KEY' };
-    for (let i = 0; i < 3; i++) {
-      await makeRequest('POST', '/api/audit/recovery', attackerHeaders);
+    // 6. API-006: Rate limiter proxy NÉLKÜL: a hamisított X-Forwarded-For figyelmen kívül marad
+    // (az attacker minden próbánál más IP-t hamisít, de a socket címe alapján mégis kizárásra kerül)
+    const recoveryUrl = '/api/audit/recovery';
+    const statuses6: number[] = [];
+    for (let i = 1; i <= 6; i++) {
+      const r = await makeRequest('POST', recoveryUrl, { 'X-Forwarded-For': `203.0.113.${i}`, 'X-TMPSP-Admin-Key': 'BAD-KEY' });
+      statuses6.push(r.status);
     }
-    const resRateLimited = await makeRequest('POST', '/api/audit/recovery', attackerHeaders);
     apiResults.push({
       id: 'API-006',
-      nev: 'DoS-Biztos Hibás-Kísérlet Rate Limiter (429 Too Many Requests)',
-      sikeres: resRateLimited.status === 429,
-      vart: 'HTTP 429 Too Many Requests',
-      kapott: `HTTP ${resRateLimited.status} (${resRateLimited.body?.error})`,
+      nev: 'Rate Limiter Proxy Nélkül: Hamisított X-Forwarded-For Nem Játssza Ki (429)',
+      sikeres: statuses6.slice(0, 3).every((c) => c === 403) && statuses6.slice(3).every((c) => c === 429),
+      vart: '403, 403, 403, 429, 429, 429',
+      kapott: statuses6.join(', '),
     });
 
-    // 7. API-007: Sikeres Adminisztratív Recovery Karantén Állapotból Valódi Admintól (HTTP 200 OK)
-    // Valid admin IP 10.0.0.1 sending correct admin key is NOT blocked by attacker IP!
-    const resRecoverySuccess = await makeRequest(
-      'POST',
-      '/api/audit/recovery',
-      { 'X-Forwarded-For': '10.0.0.1', 'X-TMPSP-Admin-Key': 'tmpsp-admin-recovery-2026' }
-    );
+    // 7. API-007: Rate limiter proxy MÖGÖTT (trust proxy = 1): csak a megbízható proxy által hozzáfűzött
+    // (jobb szélső) cím számít, a kliens által beszúrt bal szélső hamis elemek nem
+    app.set('trust proxy', 1);
+    const statuses7: number[] = [];
+    for (let i = 1; i <= 6; i++) {
+      const r = await makeRequest('POST', recoveryUrl, { 'X-Forwarded-For': `198.51.100.${i}, 192.168.1.100`, 'X-TMPSP-Admin-Key': 'BAD-KEY' });
+      statuses7.push(r.status);
+    }
     apiResults.push({
       id: 'API-007',
+      nev: 'Rate Limiter Proxy Mögött: Hamis Bal Szélső X-Forwarded-For Elemek Nem Játsszák Ki (429)',
+      sikeres: statuses7.slice(0, 3).every((c) => c === 403) && statuses7.slice(3).every((c) => c === 429),
+      vart: '403, 403, 403, 429, 429, 429',
+      kapott: statuses7.join(', '),
+    });
+
+    // 8. API-008: A valódi admin (másik IP) a helyes kulccsal nincs kizárva, a recovery sikeres (HTTP 200)
+    const resRecoverySuccess = await makeRequest(
+      'POST',
+      recoveryUrl,
+      { 'X-Forwarded-For': '10.0.0.1', 'X-TMPSP-Admin-Key': TEST_ADMIN_KEY }
+    );
+    apiResults.push({
+      id: 'API-008',
       nev: 'Sikeres Adminisztratív Helyreállítás Karantén Állapotból (HTTP 200 OK)',
       sikeres: resRecoverySuccess.status === 200 && resRecoverySuccess.body?.serverIntegrityState === 'OPERATIONAL',
       vart: 'HTTP 200 OK, serverIntegrityState = OPERATIONAL',
       kapott: `HTTP ${resRecoverySuccess.status}, state = ${resRecoverySuccess.body?.serverIntegrityState}`,
     });
+    app.set('trust proxy', false);
+
+    // 9–12. Indítási szabályok (külön folyamatban, tiszta környezettel, NODE_ENV nélkül is)
+    const childDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-child-'));
+    const runChild = (extraEnv: Record<string, string>) => {
+      const env: Record<string, string> = { PATH: process.env.PATH || '', HOME: process.env.HOME || '', TMPSP_DATA_DIR: childDir, ...extraEnv };
+      return spawnSync(process.execPath, ['--import', 'tsx', path.resolve(ROOT_DIR, 'server.ts')], { cwd: ROOT_DIR, env, encoding: 'utf8', timeout: 30000 });
+    };
+    try {
+      const c9 = runChild({}); // NODE_ENV nincs beállítva, titkok nincsenek
+      apiResults.push({
+        id: 'API-009',
+        nev: 'Fail-Closed Indítás: NODE_ENV És Titkok Nélkül A Szerver Leáll',
+        sikeres: c9.status === 1 && /Hiányzó kötelező titkok/.test(c9.stderr || ''),
+        vart: 'exit 1, "Hiányzó kötelező titkok"',
+        kapott: `exit ${c9.status}, ${(c9.stderr || '').split('\n')[0].slice(0, 80)}`,
+      });
+
+      const c10 = runChild({ NODE_ENV: 'production' });
+      apiResults.push({
+        id: 'API-010',
+        nev: 'Fail-Closed Indítás: NODE_ENV=production És Titkok Nélkül A Szerver Leáll',
+        sikeres: c10.status === 1 && /Hiányzó kötelező titkok/.test(c10.stderr || ''),
+        vart: 'exit 1',
+        kapott: `exit ${c10.status}`,
+      });
+
+      const c11 = runChild({ NODE_ENV: 'production', TMPSP_ALLOW_DEV_KEYS: '1' });
+      apiResults.push({
+        id: 'API-011',
+        nev: 'Fejlesztői Alapkulcsok Éles Módban Tiltottak (TMPSP_ALLOW_DEV_KEYS=1 + production)',
+        sikeres: c11.status === 1 && /nem engedélyezett NODE_ENV=production/.test(c11.stderr || ''),
+        vart: 'exit 1',
+        kapott: `exit ${c11.status}`,
+      });
+
+      const c12 = runChild({ TMPSP_OPERATOR_KEY: 'a', TMPSP_ADMIN_KEY: 'b', TMPSP_HMAC_KEY: 'c', TMPSP_TRUST_PROXY: 'true' });
+      apiResults.push({
+        id: 'API-012',
+        nev: 'TMPSP_TRUST_PROXY=true Tiltott (Hamisítható X-Forwarded-For Elkerülése)',
+        sikeres: c12.status === 1 && /TMPSP_TRUST_PROXY/.test(c12.stderr || ''),
+        vart: 'exit 1',
+        kapott: `exit ${c12.status}`,
+      });
+    } finally {
+      try { fs.rmSync(childDir, { recursive: true, force: true }); } catch {}
+    }
 
   } finally {
     serverInstance.close();

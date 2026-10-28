@@ -31,20 +31,60 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3000;
 
-const allowDevKeys = process.env.NODE_ENV !== 'production' || process.env.TMPSP_ALLOW_DEV_KEYS === '1';
+/**
+ * Titokkezelés – FAIL-CLOSED minden üzemmódban.
+ * A NODE_ENV NEM dönt a biztonsági szabályról (nem beállított NODE_ENV nem gyengítheti a védelmet).
+ * A nyilvános fejlesztői alapkulcsok kizárólag a kifejezett TMPSP_ALLOW_DEV_KEYS=1 kapcsolóval érhetők el,
+ * és NODE_ENV=production mellett a kapcsoló is tiltott.
+ */
+const DEV_KEYS = {
+  operator: 'tmpsp-operator-token-2026',
+  admin: 'tmpsp-admin-recovery-2026',
+  hmac: 'tmpsp-secret-hmac-key-2026',
+} as const;
 
-// Hitelesítési kulcsok és titkos HMAC kulcsok (környezeti változóból, hiányzó kulcs esetén fail-closed leállás)
-const OPERATOR_TOKEN = process.env.TMPSP_OPERATOR_KEY || (allowDevKeys ? 'tmpsp-operator-token-2026' : '');
-const ADMIN_RECOVERY_KEY = process.env.TMPSP_ADMIN_KEY || (allowDevKeys ? 'tmpsp-admin-recovery-2026' : '');
-const HMAC_SECRET = process.env.TMPSP_HMAC_KEY || (allowDevKeys ? 'tmpsp-secret-hmac-key-2026' : '');
+const wantsDevKeys = process.env.TMPSP_ALLOW_DEV_KEYS === '1';
 
-if (!allowDevKeys && (!process.env.TMPSP_OPERATOR_KEY || !process.env.TMPSP_ADMIN_KEY || !process.env.TMPSP_HMAC_KEY)) {
-  console.error('CRITICAL CONFIGURATION ERROR: Mandatory environment secrets TMPSP_OPERATOR_KEY, TMPSP_ADMIN_KEY, and TMPSP_HMAC_KEY must be configured! Set TMPSP_ALLOW_DEV_KEYS=1 for local development with default test keys.');
+if (wantsDevKeys && process.env.NODE_ENV === 'production') {
+  console.error('CRITICAL CONFIGURATION ERROR: TMPSP_ALLOW_DEV_KEYS=1 nem engedélyezett NODE_ENV=production mellett (nyilvános fejlesztői kulcsok).');
   process.exit(1);
 }
 
-if (process.env.NODE_ENV === 'test' || process.env.TRUST_PROXY === '1') {
-  app.set('trust proxy', true);
+const missingSecrets = (['TMPSP_OPERATOR_KEY', 'TMPSP_ADMIN_KEY', 'TMPSP_HMAC_KEY'] as const).filter((k) => !process.env[k]);
+if (!wantsDevKeys && missingSecrets.length > 0) {
+  console.error(`CRITICAL CONFIGURATION ERROR: Hiányzó kötelező titkok: ${missingSecrets.join(', ')}. A szerver nem indul el. Helyi fejlesztéshez: TMPSP_ALLOW_DEV_KEYS=1 (npm run dev).`);
+  process.exit(1);
+}
+
+const OPERATOR_TOKEN = process.env.TMPSP_OPERATOR_KEY || DEV_KEYS.operator;
+const ADMIN_RECOVERY_KEY = process.env.TMPSP_ADMIN_KEY || DEV_KEYS.admin;
+const HMAC_SECRET = process.env.TMPSP_HMAC_KEY || DEV_KEYS.hmac;
+
+if (wantsDevKeys) {
+  console.warn('[TMPSP FIGYELMEZTETÉS] Nyilvános fejlesztői kulcsok aktívak (TMPSP_ALLOW_DEV_KEYS=1). Éles használatra TILOS!');
+}
+
+/**
+ * Reverse proxy megbízhatóság: alapértelmezetten KIKAPCSOLT (a kliens IP a socket címe).
+ * TMPSP_TRUST_PROXY: megbízható proxy-ugrások száma (pl. "1") vagy CIDR/alhálózat lista.
+ * A "true" / minden-proxy-megbízható beállítás tiltott, mert az X-Forwarded-For hamisíthatóvá válik.
+ */
+export function parseTrustProxy(raw: string | undefined): number | string | false {
+  if (!raw) return false;
+  const v = raw.trim();
+  if (/^\d+$/.test(v)) return Number(v);
+  if (['true', 'false', 'all', '*'].includes(v.toLowerCase())) {
+    if (v.toLowerCase() === 'false') return false;
+    throw new Error("TMPSP_TRUST_PROXY: a 'true' / 'all' érték tiltott; adja meg az ugrások számát vagy CIDR listát.");
+  }
+  return v;
+}
+
+try {
+  app.set('trust proxy', parseTrustProxy(process.env.TMPSP_TRUST_PROXY));
+} catch (e: any) {
+  console.error(`CRITICAL CONFIGURATION ERROR: ${e.message}`);
+  process.exit(1);
 }
 
 app.use(express.json());
@@ -497,13 +537,17 @@ app.post('/api/audit/recovery', (req, res) => {
   }
 
   // 2. IP-alapú Rate Limiter kizárólag a SIKERTELEN próbálkozásokra (DoS védelem)
-  const trustProxy = app.get('trust proxy');
-  const forwarded = req.headers['x-forwarded-for'];
-  const clientIp = trustProxy && typeof forwarded === 'string'
-    ? forwarded.split(',')[0].trim()
-    : (req.socket?.remoteAddress || req.ip || 'unknown-client');
+  // req.ip: az Express a 'trust proxy' beállítás szerint számolja (alapból a socket címe;
+  // proxy mögött a megbízható láncban jobbról számított első nem megbízható cím).
+  // Az X-Forwarded-For bal szélső (kliens által megadott) eleme SOHA nem számít.
+  const clientIp = req.ip || req.socket?.remoteAddress || 'unknown-client';
 
   const now = Date.now();
+  if (failedRecoveryAttemptsMap.size > 10000) {
+    for (const [ip, ts] of failedRecoveryAttemptsMap) {
+      if (ts.every((t) => now - t >= 15 * 60 * 1000)) failedRecoveryAttemptsMap.delete(ip);
+    }
+  }
   const clientFailures = (failedRecoveryAttemptsMap.get(clientIp) || []).filter((t) => now - t < 15 * 60 * 1000);
 
   if (clientFailures.length >= 3) {
