@@ -10,7 +10,7 @@
  * 5. Külső bizalmi horgony (Trust Anchor: teljes lánc-újragenerálási / kicserélési támadás detektálása)
  */
 
-import { sha256Utf8 } from './sha256.ts';
+import { sha256Utf8, hmacSha256Utf8, timingSafeEqualStrings } from './sha256.ts';
 import { canonicalJsonStringify } from './canonicalJson.ts';
 
 export const GENESIS_PREV_HASH = '0000000000000000000000000000000000000000000000000000000000000000';
@@ -91,13 +91,11 @@ export interface VerificationResult {
   verifiedRecords: number;
 }
 
-import crypto from 'crypto';
-
 /**
- * HMAC-SHA256 aláírás számítása a bizalmi horgony védelméhez
+ * HMAC-SHA256 aláírás számítása a bizalmi horgony védelméhez (platformfüggetlen)
  */
 export function computeHmacSha256(key: string, data: string): string {
-  return crypto.createHmac('sha256', key).update(data).digest('hex');
+  return hmacSha256Utf8(key, data);
 }
 
 /**
@@ -207,12 +205,20 @@ export function verifyAuditChain(
       };
     }
 
-    // HMAC digitális aláírás verifikációja, ha hmacKey megadásra került
-    if (hmacKey && trustAnchor.authoritativeDigest) {
+    // HMAC digitális aláírás jelenlétének és érvényességének szigorú ellenőrzése
+    if (!trustAnchor.authoritativeDigest || typeof trustAnchor.authoritativeDigest !== 'string') {
+      return {
+        isValid: false,
+        errorCode: 'TRUST_ANCHOR_MISMATCH',
+        brokenIndex: trustAnchor.checkpointIndex,
+        brokenReason: 'Külső bizalmi horgony hiányzó vagy érvénytelen authoritativeDigest HMAC aláírás (a mező eltávolítását a rendszer detektálta)!',
+        verifiedRecords: trustAnchor.checkpointIndex,
+      };
+    }
+
+    if (hmacKey) {
       const expectedDigest = computeHmacSha256(hmacKey, `${trustAnchor.checkpointHash}|${trustAnchor.checkpointTimestamp}|MNB_PST_AUTHORITY`);
-      const digestBuf = Buffer.from(trustAnchor.authoritativeDigest, 'hex');
-      const expectedBuf = Buffer.from(expectedDigest, 'hex');
-      const isDigestValid = digestBuf.length === expectedBuf.length && crypto.timingSafeEqual(digestBuf, expectedBuf);
+      const isDigestValid = timingSafeEqualStrings(trustAnchor.authoritativeDigest, expectedDigest);
 
       if (!isDigestValid) {
         return {
@@ -234,3 +240,4 @@ export function verifyAuditChain(
     verifiedRecords: records.length,
   };
 }
+

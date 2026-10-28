@@ -31,21 +31,31 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3000;
 
-// Hitelesítési kulcsok és titkos HMAC kulcsok (környezeti változóból vagy audit alapértékből)
-const OPERATOR_TOKEN = process.env.TMPSP_OPERATOR_KEY || 'tmpsp-operator-token-2026';
-const ADMIN_RECOVERY_KEY = process.env.TMPSP_ADMIN_KEY || 'tmpsp-admin-recovery-2026';
-const HMAC_SECRET = process.env.TMPSP_HMAC_KEY || 'tmpsp-secret-hmac-key-2026';
+const isProduction = process.env.NODE_ENV === 'production';
+
+// Hitelesítési kulcsok és titkos HMAC kulcsok (környezeti változóból, élesben kötelező)
+const OPERATOR_TOKEN = process.env.TMPSP_OPERATOR_KEY || (isProduction ? '' : 'tmpsp-operator-token-2026');
+const ADMIN_RECOVERY_KEY = process.env.TMPSP_ADMIN_KEY || (isProduction ? '' : 'tmpsp-admin-recovery-2026');
+const HMAC_SECRET = process.env.TMPSP_HMAC_KEY || (isProduction ? '' : 'tmpsp-secret-hmac-key-2026');
+
+if (isProduction && (!process.env.TMPSP_OPERATOR_KEY || !process.env.TMPSP_ADMIN_KEY || !process.env.TMPSP_HMAC_KEY)) {
+  console.error('CRITICAL CONFIGURATION ERROR: Mandatory production environment secrets TMPSP_OPERATOR_KEY, TMPSP_ADMIN_KEY, and TMPSP_HMAC_KEY must be set!');
+  process.exit(1);
+}
 
 app.use(express.json());
 
-// Adattárolási könyvtár és fájlok
-const DATA_DIR = path.resolve(__dirname, 'data');
-const AUDIT_LEDGER_FILE = path.resolve(DATA_DIR, 'audit-ledger.jsonl');
-const TRUST_ANCHOR_FILE = path.resolve(DATA_DIR, 'trust-anchor.json');
-const QUARANTINE_INCIDENT_FILE = path.resolve(DATA_DIR, 'quarantine-incident.json');
+// Adattárolási könyvtár és dinamikus fájlútvonalak (TMPSP_DATA_DIR felülbírálással)
+const getDATA_DIR = () => process.env.TMPSP_DATA_DIR ? path.resolve(process.env.TMPSP_DATA_DIR) : path.resolve(__dirname, 'data');
+const getAUDIT_LEDGER_FILE = () => path.resolve(getDATA_DIR(), 'audit-ledger.jsonl');
+const getTRUST_ANCHOR_FILE = () => path.resolve(getDATA_DIR(), 'trust-anchor.json');
+const getQUARANTINE_INCIDENT_FILE = () => path.resolve(getDATA_DIR(), 'quarantine-incident.json');
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+function ensureDataDirExists(): void {
+  const dir = getDATA_DIR();
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
 }
 
 // Szerver integritási állapota: 'OPERATIONAL' | 'INTEGRITY_FAILURE'
@@ -53,8 +63,8 @@ let serverIntegrityState: 'OPERATIONAL' | 'INTEGRITY_FAILURE' = 'OPERATIONAL';
 let lastIntegrityError: string | null = null;
 let lastIntegrityErrorCode: string | null = null;
 
-// Rate limiter tömb a recovery próbálkozásokhoz
-let recoveryAttempts: number[] = [];
+// IP-alapú hibás kísérletek nyilvántartása (DoS-biztos rate limiter)
+const failedRecoveryAttemptsMap = new Map<string, number[]>();
 
 /**
  * Constant-time időbélyeg-biztos string összehasonlítás
@@ -71,15 +81,16 @@ function timingSafeCompare(a: string, b: string): boolean {
  * Incidens naplózása a quarantine-incident.json fájlba
  */
 function recordQuarantineIncident(errorCode: string, brokenIndex: number | null, reason: string): void {
+  ensureDataDirExists();
   const incidentData = {
     incidentTimestamp: new Date().toISOString(),
     errorCode,
     brokenIndex,
     reason,
-    ledgerPath: AUDIT_LEDGER_FILE,
+    ledgerPath: getAUDIT_LEDGER_FILE(),
     action: 'QUARANTINE_MODE_ACTIVE - Minden naplóírás zárolva, bizonyíték változatlanul megőrizve.',
   };
-  fs.writeFileSync(QUARANTINE_INCIDENT_FILE, JSON.stringify(incidentData, null, 2), 'utf8');
+  fs.writeFileSync(getQUARANTINE_INCIDENT_FILE(), JSON.stringify(incidentData, null, 2), 'utf8');
 }
 
 /**
@@ -87,8 +98,9 @@ function recordQuarantineIncident(errorCode: string, brokenIndex: number | null,
  * Szigorú feldolgozás: Sérült vagy csonkolt sor esetén kivételt dob (nincs csendes eldobás)!
  */
 function readAuditLedger(): CanonicalAuditRecord[] {
-  if (!fs.existsSync(AUDIT_LEDGER_FILE)) return [];
-  const content = fs.readFileSync(AUDIT_LEDGER_FILE, 'utf8');
+  const file = getAUDIT_LEDGER_FILE();
+  if (!fs.existsSync(file)) return [];
+  const content = fs.readFileSync(file, 'utf8');
   if (!content.trim()) return [];
   const lines = content.split('\n').filter((l) => l.trim().length > 0);
   return lines.map((l, idx) => {
@@ -104,9 +116,10 @@ function readAuditLedger(): CanonicalAuditRecord[] {
  * Külső bizalmi horgony (Trust Anchor) beolvasása
  */
 function readTrustAnchor(): TrustAnchor | null {
-  if (!fs.existsSync(TRUST_ANCHOR_FILE)) return null;
+  const file = getTRUST_ANCHOR_FILE();
+  if (!fs.existsSync(file)) return null;
   try {
-    return JSON.parse(fs.readFileSync(TRUST_ANCHOR_FILE, 'utf8'));
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch {
     return null;
   }
@@ -116,6 +129,7 @@ function readTrustAnchor(): TrustAnchor | null {
  * Kezdeti auditnapló és bizalmi horgony kiépítése (KIZÁRÓLAG ÚJ RENDSZER INDULÁSAKOR)
  */
 function initializeFreshLedgerAndAnchor(): void {
+  ensureDataDirExists();
   console.log('[TMPSP AUDIT] Új audit napló és bizalmi horgony inicializálása...');
 
   const seed0Id = 'AUD-2024Q1-001';
@@ -171,7 +185,7 @@ function initializeFreshLedgerAndAnchor(): void {
   };
 
   const content = [JSON.stringify(seedRecord0), JSON.stringify(seedRecord1)].join('\n') + '\n';
-  fs.writeFileSync(AUDIT_LEDGER_FILE, content, 'utf8');
+  fs.writeFileSync(getAUDIT_LEDGER_FILE(), content, 'utf8');
 
   // Külső bizalmi horgony (Trust Anchor) elmentése titkos HMAC-SHA256 aláírással
   const authoritativeDigest = computeHmacSha256(HMAC_SECRET, `${seed1Hash}|${seed1Timestamp}|MNB_PST_AUTHORITY`);
@@ -182,7 +196,7 @@ function initializeFreshLedgerAndAnchor(): void {
     authoritativeDigest,
     description: 'Hitelesített jegybanki ellenőrzőpont a 2024Q4 kalibrációs záráshoz (HMAC védett).',
   };
-  fs.writeFileSync(TRUST_ANCHOR_FILE, JSON.stringify(trustAnchor, null, 2), 'utf8');
+  fs.writeFileSync(getTRUST_ANCHOR_FILE(), JSON.stringify(trustAnchor, null, 2), 'utf8');
 
   serverIntegrityState = 'OPERATIONAL';
   lastIntegrityError = null;
@@ -194,7 +208,8 @@ function initializeFreshLedgerAndAnchor(): void {
  * Ha a fájl létezik, de sérült vagy hiányzik a bizalmi horgony, a szerver SOHA NEM generál újat, hanem azonnal karanténba lép!
  */
 function startupIntegrityCheck(): void {
-  if (!fs.existsSync(AUDIT_LEDGER_FILE)) {
+  ensureDataDirExists();
+  if (!fs.existsSync(getAUDIT_LEDGER_FILE())) {
     initializeFreshLedgerAndAnchor();
     return;
   }
@@ -400,7 +415,7 @@ app.post('/api/audit', requireOperatorAuth, (req, res) => {
     };
 
     // Szigorú append-only hozzáfűzés a lemezre
-    fs.appendFileSync(AUDIT_LEDGER_FILE, JSON.stringify(newRecord) + '\n', 'utf8');
+    fs.appendFileSync(getAUDIT_LEDGER_FILE(), JSON.stringify(newRecord) + '\n', 'utf8');
 
     // Bizalmi horgony frissítése a legújabb fejrekordra titkos HMAC aláírással
     const updatedAnchorIndex = existingRecords.length;
@@ -412,7 +427,7 @@ app.post('/api/audit', requireOperatorAuth, (req, res) => {
       authoritativeDigest: updatedAuthoritativeDigest,
       description: `Hitelesített jegybanki ellenőrzőpont (${newRecordId}).`,
     };
-    fs.writeFileSync(TRUST_ANCHOR_FILE, JSON.stringify(updatedTrustAnchor, null, 2), 'utf8');
+    fs.writeFileSync(getTRUST_ANCHOR_FILE(), JSON.stringify(updatedTrustAnchor, null, 2), 'utf8');
 
     res.json({
       success: true,
@@ -467,7 +482,7 @@ app.get('/api/audit/verify', (req, res) => {
 });
 
 // API: Adminisztratív helyreállítási protokoll (AUD-001 KÖVETELMÉNY)
-// Szigorúan védett timing-safe módon, RATE LIMIT-tel, ÉS KIZÁRÓLAG INTEGRITY_FAILURE MÓDBAN!
+// Szigorúan védett timing-safe módon, SIKERTELEN KÍSÉRLET ALAPÚ IP RATE LIMIT-tel, KIZÁRÓLAG INTEGRITY_FAILURE MÓDBAN!
 app.post('/api/audit/recovery', (req, res) => {
   // 1. Szigorú üzemi állapot szűrő: rendes üzemi állapotban tilos a napló törlése/újraindítása!
   if (serverIntegrityState !== 'INTEGRITY_FAILURE') {
@@ -477,33 +492,44 @@ app.post('/api/audit/recovery', (req, res) => {
     });
   }
 
-  // 2. Rate limiter: maximum 3 próbálkozás 15 percen belül
+  // 2. IP-alapú Rate Limiter kizárólag a SIKERTELEN próbálkozásokra (DoS védelem)
+  const forwarded = req.headers['x-forwarded-for'];
+  const clientIp = typeof forwarded === 'string'
+    ? forwarded.split(',')[0].trim()
+    : (req.ip || req.socket.remoteAddress || 'unknown-client');
+
   const now = Date.now();
-  recoveryAttempts = recoveryAttempts.filter((t) => now - t < 15 * 60 * 1000);
-  if (recoveryAttempts.length >= 3) {
+  const clientFailures = (failedRecoveryAttemptsMap.get(clientIp) || []).filter((t) => now - t < 15 * 60 * 1000);
+
+  if (clientFailures.length >= 3) {
     return res.status(429).json({
       success: false,
-      error: 'TOO_MANY_REQUESTS: Túl sok helyreállítási kísérlet. Maximum 3 próbálkozás engedélyezett 15 percen belül.',
+      error: 'TOO_MANY_REQUESTS: Túl sok hibás helyreállítási kísérlet ebből az IP címből. Maximum 3 hibás próbálkozás engedélyezett 15 percen belül.',
     });
   }
-  recoveryAttempts.push(now);
 
   const adminKey = req.headers['x-tmpsp-admin-key'] || req.body?.adminKey;
 
   if (typeof adminKey !== 'string' || !timingSafeCompare(adminKey, ADMIN_RECOVERY_KEY)) {
+    // SIKERTELEN kísérlet regisztrálása ehhez az IP-hez
+    clientFailures.push(now);
+    failedRecoveryAttemptsMap.set(clientIp, clientFailures);
     return res.status(403).json({
       success: false,
       error: 'FORBIDDEN: Az audit helyreállítási eljárás szigorúan védett adminisztratív jogosultságot igényel.',
     });
   }
 
+  // Sikeres hitelesítés törli az IP hibaszámlálóját
+  failedRecoveryAttemptsMap.delete(clientIp);
+
   try {
     // 1. A meglévő (esetleg sérült) fájl forenzikus archiválása időbélyeggel
     const archiveTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const archivePath = path.resolve(DATA_DIR, `archived-corrupted-ledger-${archiveTimestamp}.jsonl`);
+    const archivePath = path.resolve(getDATA_DIR(), `archived-corrupted-ledger-${archiveTimestamp}.jsonl`);
 
-    if (fs.existsSync(AUDIT_LEDGER_FILE)) {
-      fs.copyFileSync(AUDIT_LEDGER_FILE, archivePath);
+    if (fs.existsSync(getAUDIT_LEDGER_FILE())) {
+      fs.copyFileSync(getAUDIT_LEDGER_FILE(), archivePath);
       console.log(`[TMPSP AUDIT RECOVERY] Korábbi napló archiválva forenzikus vizsgálatra: ${archivePath}`);
     }
 
@@ -542,12 +568,9 @@ async function startServer() {
   });
 }
 
-export { app, startupIntegrityCheck, initializeFreshLedgerAndAnchor, readAuditLedger, readTrustAnchor, DATA_DIR, AUDIT_LEDGER_FILE, TRUST_ANCHOR_FILE, QUARANTINE_INCIDENT_FILE };
+export { app, startupIntegrityCheck, initializeFreshLedgerAndAnchor, readAuditLedger, readTrustAnchor, getDATA_DIR };
 
 const isMainModule = process.argv[1] && (process.argv[1].endsWith('server.ts') || process.argv[1].endsWith('server.js'));
 if (isMainModule && process.env.NODE_ENV !== 'test') {
   startServer();
 }
-
-
-

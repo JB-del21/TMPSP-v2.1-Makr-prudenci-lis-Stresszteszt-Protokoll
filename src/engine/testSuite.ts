@@ -44,6 +44,7 @@ import { evaluateModule2 } from './stateMachine';
 import { runThresholdBacktest } from './calibration';
 import {
   computeCanonicalRecordHash,
+  computeHmacSha256,
   verifyAuditChain,
   CanonicalAuditRecord,
   TrustAnchor,
@@ -815,5 +816,50 @@ export function runAllEngineTests(): TestResult[] {
     kapott: `isValid = ${idForgedVerify.isValid}, brokenIndex = ${idForgedVerify.brokenIndex}, code = ${idForgedVerify.errorCode}`,
   });
 
+  // WRM-011: Hiányzó / Törölt authoritativeDigest mező detektálása a bizalmi horgonyban
+  const missingDigestAnchor: TrustAnchor = {
+    checkpointIndex: 2,
+    checkpointHash: rec2Hash,
+    checkpointTimestamp: rec2Timestamp,
+    authoritativeDigest: '',
+    description: 'Csonkított horgony digest nélkül',
+  };
+  const missingDigestVerify = verifyAuditChain(validChain, missingDigestAnchor, 'secret-key');
+  results.push({
+    id: 'WRM-011',
+    kategoria: 'WORM_INTEGRITÁS',
+    nev: 'Hiányzó / Törölt authoritativeDigest Mező Detektálása',
+    leiras: 'Ha a támadó kitörli az authoritativeDigest mezőt a bizalmi horgonyból, a verifikáció azonnal TRUST_ANCHOR_MISMATCH hibával elutasítja.',
+    sikeres: !missingDigestVerify.isValid && missingDigestVerify.errorCode === 'TRUST_ANCHOR_MISMATCH',
+    vart: 'isValid = false, errorCode = TRUST_ANCHOR_MISMATCH',
+    kapott: `isValid = ${missingDigestVerify.isValid}, code = ${missingDigestVerify.errorCode}`,
+  });
+
+  // WRM-012: HMAC Kulcs Eltérés Detektálása a Bizalmi Horgony Aláírásában
+  const correctSecret = 'tmpsp-real-secret-key';
+  const wrongSecret = 'tmpsp-forged-secret-key';
+  const validHmacDigest = computeHmacSha256(correctSecret, `${rec2Hash}|${rec2Timestamp}|MNB_PST_AUTHORITY`);
+  const hmacAnchor: TrustAnchor = {
+    checkpointIndex: 2,
+    checkpointHash: rec2Hash,
+    checkpointTimestamp: rec2Timestamp,
+    authoritativeDigest: validHmacDigest,
+    description: 'Valódi HMAC aláírással védett horgony',
+  };
+
+  const hmacMatchVerify = verifyAuditChain(validChain, hmacAnchor, correctSecret);
+  const hmacMismatchVerify = verifyAuditChain(validChain, hmacAnchor, wrongSecret);
+
+  results.push({
+    id: 'WRM-012',
+    kategoria: 'WORM_INTEGRITÁS',
+    nev: 'HMAC Titkos Kulcs Hitelesítés és Hamisítás-Detektálás',
+    leiras: 'Helyes HMAC kulccsal érvényes, hamis/módosított HMAC kulccsal TRUST_ANCHOR_MISMATCH elutasítást ad.',
+    sikeres: hmacMatchVerify.isValid && !hmacMismatchVerify.isValid && hmacMismatchVerify.errorCode === 'TRUST_ANCHOR_MISMATCH',
+    vart: 'match = true, mismatch = TRUST_ANCHOR_MISMATCH',
+    kapott: `match = ${hmacMatchVerify.isValid}, mismatchCode = ${hmacMismatchVerify.errorCode}`,
+  });
+
   return results;
 }
+

@@ -5,12 +5,16 @@
 
 import http from 'http';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const ROOT_DIR = path.resolve(__dirname, '../..');
+
+// Szigorúan elszeparált, ideiglenes teszt könyvtár létrehozása (Fix #4: az éles/dev data/ mappa védelme)
+const tmpDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-api-test-'));
+process.env.TMPSP_DATA_DIR = tmpDataDir;
 
 // Test környezeti beállítás
 process.env.NODE_ENV = 'test';
@@ -22,9 +26,7 @@ import {
   app,
   startupIntegrityCheck,
   initializeFreshLedgerAndAnchor,
-  DATA_DIR,
-  AUDIT_LEDGER_FILE,
-  TRUST_ANCHOR_FILE,
+  getDATA_DIR,
 } from '../../server.ts';
 
 const TEST_PORT = 3099;
@@ -91,9 +93,10 @@ async function runApiIntegrationTests(): Promise<void> {
   console.log('================================================================');
   console.log('TMPSP v2.1 – HTTP API ENDPOINT INTEGRÁCIÓS ÉS BIZTONSÁGI TESZTEK');
   console.log('MNB Pénzügyi Stabilitási Tanács Audithitelesítési Specifikáció');
+  console.log(`[TESZT ELSZEPARÁLÁS] Ideiglenes könyvtár: ${tmpDataDir}`);
   console.log('================================================================\n');
 
-  // Inicializáljunk tiszta teszt bázisállapotot érvényes HMAC horgonnyal
+  // Inicializáljunk tiszta teszt bázisállapotot érvényes HMAC horgonnyal az ideiglenes könyvtárban
   initializeFreshLedgerAndAnchor();
 
   // Indítsuk el a teszt HTTP szervert
@@ -106,7 +109,7 @@ async function runApiIntegrationTests(): Promise<void> {
   const apiResults: ApiTestResult[] = [];
 
   try {
-    // 1. API-001: 401 Unauthorized token hiányában
+    // 1. API-001: 401 Unauthorized hitelesítés nélküli írásnál
     const resAuthMissing = await makeRequest('POST', '/api/audit', {}, { negyedev: '2024Q1', esemenyTipus: 'PILOT', kepletVerzio: 'v2.1', felelős: 'MNB' });
     apiResults.push({
       id: 'API-001',
@@ -123,8 +126,9 @@ async function runApiIntegrationTests(): Promise<void> {
       { Authorization: 'Bearer tmpsp-operator-token-2026' },
       { negyedev: '2025Q1', esemenyTipus: 'TESZT_HOZZÁFŰZÉS', kepletVerzio: 'v2.1', felelős: 'MNB PST' }
     );
-    const anchorData = JSON.parse(fs.readFileSync(TRUST_ANCHOR_FILE, 'utf8'));
-    const isAnchorUpdated = anchorData.checkpointIndex === 2; // initial 2 records (0, 1), new record is index 2
+    const anchorPath = path.resolve(tmpDataDir, 'trust-anchor.json');
+    const anchorData = JSON.parse(fs.readFileSync(anchorPath, 'utf8'));
+    const isAnchorUpdated = anchorData.checkpointIndex === 2;
 
     apiResults.push({
       id: 'API-002',
@@ -149,10 +153,9 @@ async function runApiIntegrationTests(): Promise<void> {
     });
 
     // 4. API-004: HMAC Hamisítás Detektálása a Bizalmi Horgonyban
-    // Tamper the trust anchor's authoritativeDigest
-    const anchorObj = JSON.parse(fs.readFileSync(TRUST_ANCHOR_FILE, 'utf8'));
+    const anchorObj = JSON.parse(fs.readFileSync(anchorPath, 'utf8'));
     anchorObj.authoritativeDigest = '0000000000000000000000000000000000000000000000000000000000000000';
-    fs.writeFileSync(TRUST_ANCHOR_FILE, JSON.stringify(anchorObj, null, 2), 'utf8');
+    fs.writeFileSync(anchorPath, JSON.stringify(anchorObj, null, 2), 'utf8');
 
     const resHmacTamper = await makeRequest('GET', '/api/audit/verify');
     apiResults.push({
@@ -164,8 +167,8 @@ async function runApiIntegrationTests(): Promise<void> {
     });
 
     // 5. API-005: Hiányzó bizalmi horgony esetén karantén (HTTP 423 Locked)
-    fs.unlinkSync(TRUST_ANCHOR_FILE); // delete trust anchor file while ledger exists
-    startupIntegrityCheck(); // trigger integrity check
+    fs.unlinkSync(anchorPath); // delete trust anchor file in temp dir
+    startupIntegrityCheck();
 
     const resPostLocked = await makeRequest(
       'POST',
@@ -181,14 +184,30 @@ async function runApiIntegrationTests(): Promise<void> {
       kapott: `HTTP ${resPostLocked.status}, errorCode = ${resPostLocked.body?.errorCode}`,
     });
 
-    // 6. API-006: Sikeres Adminisztratív Recovery Karantén Módosulásban (HTTP 200 OK)
+    // 6. API-006: DoS-Biztos Rate Limiting hibás próbálkozásoknál
+    // Simulating attacker IP 192.168.1.100 sending 3 bad admin keys
+    const attackerHeaders = { 'X-Forwarded-For': '192.168.1.100', 'X-TMPSP-Admin-Key': 'BAD-KEY' };
+    for (let i = 0; i < 3; i++) {
+      await makeRequest('POST', '/api/audit/recovery', attackerHeaders);
+    }
+    const resRateLimited = await makeRequest('POST', '/api/audit/recovery', attackerHeaders);
+    apiResults.push({
+      id: 'API-006',
+      nev: 'DoS-Biztos Hibás-Kísérlet Rate Limiter (429 Too Many Requests)',
+      sikeres: resRateLimited.status === 429,
+      vart: 'HTTP 429 Too Many Requests',
+      kapott: `HTTP ${resRateLimited.status} (${resRateLimited.body?.error})`,
+    });
+
+    // 7. API-007: Sikeres Adminisztratív Recovery Karantén Állapotból Valódi Admintól (HTTP 200 OK)
+    // Valid admin IP 10.0.0.1 sending correct admin key is NOT blocked by attacker IP!
     const resRecoverySuccess = await makeRequest(
       'POST',
       '/api/audit/recovery',
-      { 'X-TMPSP-Admin-Key': 'tmpsp-admin-recovery-2026' }
+      { 'X-Forwarded-For': '10.0.0.1', 'X-TMPSP-Admin-Key': 'tmpsp-admin-recovery-2026' }
     );
     apiResults.push({
-      id: 'API-006',
+      id: 'API-007',
       nev: 'Sikeres Adminisztratív Helyreállítás Karantén Állapotból (HTTP 200 OK)',
       sikeres: resRecoverySuccess.status === 200 && resRecoverySuccess.body?.serverIntegrityState === 'OPERATIONAL',
       vart: 'HTTP 200 OK, serverIntegrityState = OPERATIONAL',
@@ -197,6 +216,10 @@ async function runApiIntegrationTests(): Promise<void> {
 
   } finally {
     serverInstance.close();
+    // Ideiglenes tesztkönyvtár takarítása
+    try {
+      fs.rmSync(tmpDataDir, { recursive: true, force: true });
+    } catch {}
   }
 
   let passed = 0;

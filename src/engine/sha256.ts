@@ -113,3 +113,82 @@ export function sha256Utf8(str: string): string {
   }
   return sha256(utf8);
 }
+
+/**
+ * UTF-8 sztring konvertálása bájt tömbbé
+ */
+export function toUtf8Bytes(str: string): number[] {
+  const bytes: number[] = [];
+  for (let i = 0; i < str.length; i++) {
+    let charcode = str.charCodeAt(i);
+    if (charcode < 0x80) {
+      bytes.push(charcode);
+    } else if (charcode < 0x800) {
+      bytes.push(0xc0 | (charcode >> 6));
+      bytes.push(0x80 | (charcode & 0x3f));
+    } else if (charcode < 0xd800 || charcode >= 0xe000) {
+      bytes.push(0xe0 | (charcode >> 12));
+      bytes.push(0x80 | ((charcode >> 6) & 0x3f));
+      bytes.push(0x80 | (charcode & 0x3f));
+    } else {
+      i++;
+      charcode = 0x10000 + (((charcode & 0x3ff) << 10) | (str.charCodeAt(i) & 0x3ff));
+      bytes.push(0xf0 | (charcode >> 18));
+      bytes.push(0x80 | ((charcode >> 12) & 0x3f));
+      bytes.push(0x80 | ((charcode >> 6) & 0x3f));
+      bytes.push(0x80 | (charcode & 0x3f));
+    }
+  }
+  return bytes;
+}
+
+/**
+ * Hexadecimális sztring konvertálása bájt tömbbé
+ */
+export function hexToBytes(hex: string): number[] {
+  const bytes: number[] = [];
+  for (let c = 0; c < hex.length; c += 2) {
+    bytes.push(parseInt(hex.substr(c, 2), 16));
+  }
+  return bytes;
+}
+
+/**
+ * Pure TypeScript HMAC-SHA256 megvalósítás (FIPS 198-1 szabvány)
+ * 100%-ban platformfüggetlen: hibátlanul fut böngészőben (Vite) és Node.js-ben is.
+ */
+export function hmacSha256Utf8(key: string, message: string): string {
+  let keyBytes = toUtf8Bytes(key);
+  if (keyBytes.length > 64) {
+    const keyHashHex = sha256Utf8(key);
+    keyBytes = hexToBytes(keyHashHex);
+  }
+  while (keyBytes.length < 64) {
+    keyBytes.push(0);
+  }
+
+  const ipadBytes = keyBytes.map((b) => b ^ 0x36);
+  const opadBytes = keyBytes.map((b) => b ^ 0x5c);
+
+  const msgBytes = toUtf8Bytes(message);
+  const innerInput = ipadBytes.map((b) => String.fromCharCode(b)).join('') + msgBytes.map((b) => String.fromCharCode(b)).join('');
+  const innerHashHex = sha256(innerInput);
+
+  const innerHashBytes = hexToBytes(innerHashHex);
+  const outerInput = opadBytes.map((b) => String.fromCharCode(b)).join('') + innerHashBytes.map((b) => String.fromCharCode(b)).join('');
+  return sha256(outerInput);
+}
+
+/**
+ * Platformfüggetlen Constant-Time Sztring Összehasonlítás
+ */
+export function timingSafeEqualStrings(a: string, b: string): boolean {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+
