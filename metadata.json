@@ -1,0 +1,6 @@
+{
+  "name": "TMPSP v2.1 – Makroprudenciális Stresszteszt Protokoll",
+  "description": "Tematikus Makroprudenciális Stresszteszt-Protokoll: 4 modulból és 15 mérési sorból álló interaktív elemzői rendszer konzervatív állapotgéppel, WORM auditnaplóval és küszöb-visszateszteléssel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

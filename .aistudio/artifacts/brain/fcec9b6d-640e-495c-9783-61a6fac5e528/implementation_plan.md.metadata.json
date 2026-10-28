@@ -1,0 +1,6 @@
+{
+  "summary":  "Teszt-vezérelt (TDD) végrehajtási terv a TMPSP v2.1 mérnöki validálásához. A döntésnek megfelelően a megvalósítás 1. szakasza a teljes, automatizált tesztcsomag és a tiszta matematikai/állapotgép-motor (`src/engine/`) megépítése (indikátorspecifikus számítások, adathiány-kezelés, YoY-bázis és 2Q perzisztencia tesztek). Ezt követi a 2. szakaszban az empirikus AUC/FPR visszatesztelés a 2023Q1–2024Q4 bázison, majd a 3. szakaszban a szerveroldali append-only WORM auditnapló (`server.ts` + `/api/audit`) és az interaktív felület integrálása.",
+  "updatedAt":  "2026-10-28T20:00:35.761758042Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}
