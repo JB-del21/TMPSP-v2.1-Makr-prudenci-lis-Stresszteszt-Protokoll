@@ -1,0 +1,7 @@
+{
+  "checkpointIndex": 1,
+  "checkpointHash": "6709bf6e85fea09a97e52d01d392692b85080bfeb52ca700aa7e2e7f9f5136ab",
+  "checkpointTimestamp": "2026-10-28T12:30:00.000Z",
+  "authoritativeDigest": "92c93bbfacec937174cdc3339f356b57894e4bdc3db17d3143728a08c580e6ee",
+  "description": "Hitelesített jegybanki ellenőrzőpont a 2024Q4 kalibrációs záráshoz (HMAC védett)."
+}

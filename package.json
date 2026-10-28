@@ -8,7 +8,7 @@
     "build": "vite build",
     "start": "tsx server.ts",
     "preview": "vite preview",
-    "test": "tsx src/engine/runTestsCli.ts",
+    "test": "tsx src/engine/runTestsCli.ts && tsx src/engine/runApiTestsCli.ts",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit"
   },

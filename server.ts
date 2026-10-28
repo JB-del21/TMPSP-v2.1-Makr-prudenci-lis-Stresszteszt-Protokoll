@@ -18,6 +18,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   computeCanonicalRecordHash,
+  computeHmacSha256,
   verifyAuditChain,
   CanonicalAuditRecord,
   TrustAnchor,
@@ -30,9 +31,10 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3000;
 
-// Hitelesítési kulcsok (környezeti változóból vagy audit alapértékből)
+// Hitelesítési kulcsok és titkos HMAC kulcsok (környezeti változóból vagy audit alapértékből)
 const OPERATOR_TOKEN = process.env.TMPSP_OPERATOR_KEY || 'tmpsp-operator-token-2026';
 const ADMIN_RECOVERY_KEY = process.env.TMPSP_ADMIN_KEY || 'tmpsp-admin-recovery-2026';
+const HMAC_SECRET = process.env.TMPSP_HMAC_KEY || 'tmpsp-secret-hmac-key-2026';
 
 app.use(express.json());
 
@@ -50,6 +52,9 @@ if (!fs.existsSync(DATA_DIR)) {
 let serverIntegrityState: 'OPERATIONAL' | 'INTEGRITY_FAILURE' = 'OPERATIONAL';
 let lastIntegrityError: string | null = null;
 let lastIntegrityErrorCode: string | null = null;
+
+// Rate limiter tömb a recovery próbálkozásokhoz
+let recoveryAttempts: number[] = [];
 
 /**
  * Constant-time időbélyeg-biztos string összehasonlítás
@@ -168,13 +173,14 @@ function initializeFreshLedgerAndAnchor(): void {
   const content = [JSON.stringify(seedRecord0), JSON.stringify(seedRecord1)].join('\n') + '\n';
   fs.writeFileSync(AUDIT_LEDGER_FILE, content, 'utf8');
 
-  // Külső bizalmi horgony (Trust Anchor) elmentése
+  // Külső bizalmi horgony (Trust Anchor) elmentése titkos HMAC-SHA256 aláírással
+  const authoritativeDigest = computeHmacSha256(HMAC_SECRET, `${seed1Hash}|${seed1Timestamp}|MNB_PST_AUTHORITY`);
   const trustAnchor: TrustAnchor = {
     checkpointIndex: 1,
     checkpointHash: seed1Hash,
     checkpointTimestamp: seed1Timestamp,
-    authoritativeDigest: crypto.createHash('sha256').update(`${seed1Hash}|${seed1Timestamp}|MNB_PST_AUTHORITY`).digest('hex'),
-    description: 'Hitelesített jegybanki ellenőrzőpont a 2024Q4 kalibrációs záráshoz.',
+    authoritativeDigest,
+    description: 'Hitelesített jegybanki ellenőrzőpont a 2024Q4 kalibrációs záráshoz (HMAC védett).',
   };
   fs.writeFileSync(TRUST_ANCHOR_FILE, JSON.stringify(trustAnchor, null, 2), 'utf8');
 
@@ -206,7 +212,7 @@ function startupIntegrityCheck(): void {
       return;
     }
 
-    const verification = verifyAuditChain(existing, anchor);
+    const verification = verifyAuditChain(existing, anchor, HMAC_SECRET);
 
     if (!verification.isValid) {
       serverIntegrityState = 'INTEGRITY_FAILURE';
@@ -328,7 +334,7 @@ app.post('/api/audit', requireOperatorAuth, (req, res) => {
       });
     }
 
-    const preFlight = verifyAuditChain(existingRecords, anchor);
+    const preFlight = verifyAuditChain(existingRecords, anchor, HMAC_SECRET);
     if (!preFlight.isValid) {
       serverIntegrityState = 'INTEGRITY_FAILURE';
       lastIntegrityError = preFlight.brokenReason;
@@ -396,13 +402,14 @@ app.post('/api/audit', requireOperatorAuth, (req, res) => {
     // Szigorú append-only hozzáfűzés a lemezre
     fs.appendFileSync(AUDIT_LEDGER_FILE, JSON.stringify(newRecord) + '\n', 'utf8');
 
-    // Bizalmi horgony frissítése a legújabb fejrekordra
+    // Bizalmi horgony frissítése a legújabb fejrekordra titkos HMAC aláírással
     const updatedAnchorIndex = existingRecords.length;
+    const updatedAuthoritativeDigest = computeHmacSha256(HMAC_SECRET, `${hash}|${timestamp}|MNB_PST_AUTHORITY`);
     const updatedTrustAnchor: TrustAnchor = {
       checkpointIndex: updatedAnchorIndex,
       checkpointHash: hash,
       checkpointTimestamp: timestamp,
-      authoritativeDigest: crypto.createHash('sha256').update(`${hash}|${timestamp}|MNB_PST_AUTHORITY`).digest('hex'),
+      authoritativeDigest: updatedAuthoritativeDigest,
       description: `Hitelesített jegybanki ellenőrzőpont (${newRecordId}).`,
     };
     fs.writeFileSync(TRUST_ANCHOR_FILE, JSON.stringify(updatedTrustAnchor, null, 2), 'utf8');
@@ -422,7 +429,7 @@ app.get('/api/audit/verify', (req, res) => {
   try {
     const records = readAuditLedger();
     const anchor = readTrustAnchor();
-    const verification = verifyAuditChain(records, anchor);
+    const verification = verifyAuditChain(records, anchor, HMAC_SECRET);
 
     res.json({
       success: true,
@@ -460,8 +467,27 @@ app.get('/api/audit/verify', (req, res) => {
 });
 
 // API: Adminisztratív helyreállítási protokoll (AUD-001 KÖVETELMÉNY)
-// Szigorúan védett timing-safe módon, az eredeti fájlt archiválja, nem törli!
+// Szigorúan védett timing-safe módon, RATE LIMIT-tel, ÉS KIZÁRÓLAG INTEGRITY_FAILURE MÓDBAN!
 app.post('/api/audit/recovery', (req, res) => {
+  // 1. Szigorú üzemi állapot szűrő: rendes üzemi állapotban tilos a napló törlése/újraindítása!
+  if (serverIntegrityState !== 'INTEGRITY_FAILURE') {
+    return res.status(409).json({
+      success: false,
+      error: 'CONFLICT: Az audit helyreállítási eljárás kizárólag INTEGRITY_FAILURE (karantén) állapotban hajtható végre. Üzemi (OPERATIONAL) állapotban a napló újraindítása elutasítva.',
+    });
+  }
+
+  // 2. Rate limiter: maximum 3 próbálkozás 15 percen belül
+  const now = Date.now();
+  recoveryAttempts = recoveryAttempts.filter((t) => now - t < 15 * 60 * 1000);
+  if (recoveryAttempts.length >= 3) {
+    return res.status(429).json({
+      success: false,
+      error: 'TOO_MANY_REQUESTS: Túl sok helyreállítási kísérlet. Maximum 3 próbálkozás engedélyezett 15 percen belül.',
+    });
+  }
+  recoveryAttempts.push(now);
+
   const adminKey = req.headers['x-tmpsp-admin-key'] || req.body?.adminKey;
 
   if (typeof adminKey !== 'string' || !timingSafeCompare(adminKey, ADMIN_RECOVERY_KEY)) {
@@ -516,10 +542,12 @@ async function startServer() {
   });
 }
 
-export { app, startupIntegrityCheck, readAuditLedger, readTrustAnchor, DATA_DIR, AUDIT_LEDGER_FILE, TRUST_ANCHOR_FILE, QUARANTINE_INCIDENT_FILE };
+export { app, startupIntegrityCheck, initializeFreshLedgerAndAnchor, readAuditLedger, readTrustAnchor, DATA_DIR, AUDIT_LEDGER_FILE, TRUST_ANCHOR_FILE, QUARANTINE_INCIDENT_FILE };
 
-if (process.env.NODE_ENV !== 'test') {
+const isMainModule = process.argv[1] && (process.argv[1].endsWith('server.ts') || process.argv[1].endsWith('server.js'));
+if (isMainModule && process.env.NODE_ENV !== 'test') {
   startServer();
 }
+
 
 

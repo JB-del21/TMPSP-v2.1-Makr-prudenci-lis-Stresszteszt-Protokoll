@@ -1,7 +1,4 @@
-/**
- * TMPSP v2.1 Parancssori Tesztfuttató (CLI Test Runner)
- * Futtatás: npm test (tsx src/engine/runTestsCli.ts)
- */
+process.env.NODE_ENV = 'test';
 
 import { runAllEngineTests, TestResult } from './testSuite.ts';
 

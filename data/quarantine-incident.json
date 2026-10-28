@@ -1,0 +1,8 @@
+{
+  "incidentTimestamp": "2026-10-28T21:14:31.357Z",
+  "errorCode": "TRUST_ANCHOR_MISSING",
+  "brokenIndex": 2,
+  "reason": "A bizalmi horgony (trust-anchor.json) hiányzik a meglévő audit napló mellől! Lehetséges lánccserélési támadás.",
+  "ledgerPath": "/app/applet/data/audit-ledger.jsonl",
+  "action": "QUARANTINE_MODE_ACTIVE - Minden naplóírás zárolva, bizonyíték változatlanul megőrizve."
+}

@@ -91,12 +91,22 @@ export interface VerificationResult {
   verifiedRecords: number;
 }
 
+import crypto from 'crypto';
+
+/**
+ * HMAC-SHA256 aláírás számítása a bizalmi horgony védelméhez
+ */
+export function computeHmacSha256(key: string, data: string): string {
+  return crypto.createHmac('sha256', key).update(data).digest('hex');
+}
+
 /**
  * Szigorú, minden támadási felületet lefedő auditlánc- és bizalmi horgony ellenőrzés
  */
 export function verifyAuditChain(
   records: CanonicalAuditRecord[],
-  trustAnchor?: TrustAnchor | null
+  trustAnchor?: TrustAnchor | null,
+  hmacKey?: string
 ): VerificationResult {
   if (!records || records.length === 0) {
     return {
@@ -175,7 +185,6 @@ export function verifyAuditChain(
   }
 
   // 5. Külső bizalmi horgony (Trust Anchor) ellenőrzése
-  // Megvédi a rendszert a teljes napló-újragenerálási (Full Chain Replacement) támadástól
   if (trustAnchor) {
     if (records.length <= trustAnchor.checkpointIndex) {
       return {
@@ -196,6 +205,24 @@ export function verifyAuditChain(
         brokenReason: `Külső bizalmi horgony eltérés: a tárolt rekord hash ('${checkpointRecord.hash}') nem egyezik a védett ellenőrzőponton rögzített hiteles hash-sel ('${trustAnchor.checkpointHash}')! Teljes lánccsere (Replaced Chain Attack) detektálva.`,
         verifiedRecords: trustAnchor.checkpointIndex,
       };
+    }
+
+    // HMAC digitális aláírás verifikációja, ha hmacKey megadásra került
+    if (hmacKey && trustAnchor.authoritativeDigest) {
+      const expectedDigest = computeHmacSha256(hmacKey, `${trustAnchor.checkpointHash}|${trustAnchor.checkpointTimestamp}|MNB_PST_AUTHORITY`);
+      const digestBuf = Buffer.from(trustAnchor.authoritativeDigest, 'hex');
+      const expectedBuf = Buffer.from(expectedDigest, 'hex');
+      const isDigestValid = digestBuf.length === expectedBuf.length && crypto.timingSafeEqual(digestBuf, expectedBuf);
+
+      if (!isDigestValid) {
+        return {
+          isValid: false,
+          errorCode: 'TRUST_ANCHOR_MISMATCH',
+          brokenIndex: trustAnchor.checkpointIndex,
+          brokenReason: 'Külső bizalmi horgony HMAC hitelesítési hiba: az authoritativeDigest nem egyezik a titkos HMAC kulccsal számított értékkel! A horgony hamisítva lett.',
+          verifiedRecords: trustAnchor.checkpointIndex,
+        };
+      }
     }
   }
 
