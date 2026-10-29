@@ -31,53 +31,16 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3000;
 
-/**
- * Titokkezelés – FAIL-CLOSED minden üzemmódban.
- * A NODE_ENV NEM dönt a biztonsági szabályról (nem beállított NODE_ENV nem gyengítheti a védelmet).
- * A nyilvános fejlesztői alapkulcsok kizárólag a kifejezett TMPSP_ALLOW_DEV_KEYS=1 kapcsolóval érhetők el,
- * és NODE_ENV=production mellett a kapcsoló is tiltott.
- */
-const DEV_KEYS = {
-  operator: 'tmpsp-operator-token-2026',
-  admin: 'tmpsp-admin-recovery-2026',
-  hmac: 'tmpsp-secret-hmac-key-2026',
-} as const;
-
-const wantsDevKeys = process.env.TMPSP_ALLOW_DEV_KEYS === '1';
-
-if (wantsDevKeys && process.env.NODE_ENV === 'production') {
-  console.error('CRITICAL CONFIGURATION ERROR: TMPSP_ALLOW_DEV_KEYS=1 nem engedélyezett NODE_ENV=production mellett (nyilvános fejlesztői kulcsok).');
-  process.exit(1);
-}
-
-const missingSecrets = (['TMPSP_OPERATOR_KEY', 'TMPSP_ADMIN_KEY', 'TMPSP_HMAC_KEY'] as const).filter((k) => !process.env[k]);
-if (!wantsDevKeys && missingSecrets.length > 0) {
-  console.error(`CRITICAL CONFIGURATION ERROR: Hiányzó kötelező titkok: ${missingSecrets.join(', ')}. A szerver nem indul el. Helyi fejlesztéshez: TMPSP_ALLOW_DEV_KEYS=1 (npm run dev).`);
-  process.exit(1);
-}
-
-const OPERATOR_TOKEN = process.env.TMPSP_OPERATOR_KEY || DEV_KEYS.operator;
-const ADMIN_RECOVERY_KEY = process.env.TMPSP_ADMIN_KEY || DEV_KEYS.admin;
-const HMAC_SECRET = process.env.TMPSP_HMAC_KEY || DEV_KEYS.hmac;
-
-if (wantsDevKeys) {
-  console.warn('[TMPSP FIGYELMEZTETÉS] Nyilvános fejlesztői kulcsok aktívak (TMPSP_ALLOW_DEV_KEYS=1). Éles használatra TILOS!');
-}
-
-/**
- * Reverse proxy megbízhatóság: alapértelmezetten KIKAPCSOLT (a kliens IP a socket címe).
- * TMPSP_TRUST_PROXY: megbízható proxy-ugrások száma (pl. "1") vagy CIDR/alhálózat lista.
- * A "true" / minden-proxy-megbízható beállítás tiltott, mert az X-Forwarded-For hamisíthatóvá válik.
- */
 export function parseTrustProxy(raw: string | undefined): number | string | false {
   if (!raw) return false;
   const v = raw.trim();
-  if (/^\d+$/.test(v)) return Number(v);
-  if (['true', 'false', 'all', '*'].includes(v.toLowerCase())) {
-    if (v.toLowerCase() === 'false') return false;
+  if (/^\d+$/.test(v)) return Number(v);            // csak tisztán számjegyekből álló érték = ugrások száma
+  const lower = v.toLowerCase();
+  if (lower === 'false') return false;
+  if (['true', 'all', '*'].includes(lower)) {
     throw new Error("TMPSP_TRUST_PROXY: a 'true' / 'all' érték tiltott; adja meg az ugrások számát vagy CIDR listát.");
   }
-  return v;
+  return v;                                          // IP / CIDR / loopback / vesszős lista: változtatás nélkül az Expressnek
 }
 
 try {
@@ -86,6 +49,28 @@ try {
   console.error(`CRITICAL CONFIGURATION ERROR: ${e.message}`);
   process.exit(1);
 }
+
+if (process.env.TMPSP_ALLOW_DEV_KEYS === '1' && process.env.NODE_ENV === 'production') {
+  console.error('CRITICAL CONFIGURATION ERROR: TMPSP_ALLOW_DEV_KEYS=1 nem engedélyezett NODE_ENV=production mellett (nyilvános fejlesztői kulcsok).');
+  process.exit(1);
+}
+
+const allowDevKeys = process.env.TMPSP_ALLOW_DEV_KEYS === '1';
+
+const missingSecrets: string[] = [];
+if (!process.env.TMPSP_OPERATOR_KEY) missingSecrets.push('TMPSP_OPERATOR_KEY');
+if (!process.env.TMPSP_ADMIN_KEY) missingSecrets.push('TMPSP_ADMIN_KEY');
+if (!process.env.TMPSP_HMAC_KEY) missingSecrets.push('TMPSP_HMAC_KEY');
+
+if (!allowDevKeys && missingSecrets.length > 0) {
+  console.error(`CRITICAL CONFIGURATION ERROR: Hiányzó kötelező titkok: ${missingSecrets.join(', ')}. Állítsa be a környezeti változókat, vagy helyi fejlesztéshez TMPSP_ALLOW_DEV_KEYS=1.`);
+  process.exit(1);
+}
+
+// Hitelesítési kulcsok és titkos HMAC kulcsok
+const OPERATOR_TOKEN = process.env.TMPSP_OPERATOR_KEY || (allowDevKeys ? 'tmpsp-operator-token-2026' : '');
+const ADMIN_RECOVERY_KEY = process.env.TMPSP_ADMIN_KEY || (allowDevKeys ? 'tmpsp-admin-recovery-2026' : '');
+const HMAC_SECRET = process.env.TMPSP_HMAC_KEY || (allowDevKeys ? 'tmpsp-secret-hmac-key-2026' : '');
 
 app.use(express.json());
 
@@ -537,9 +522,7 @@ app.post('/api/audit/recovery', (req, res) => {
   }
 
   // 2. IP-alapú Rate Limiter kizárólag a SIKERTELEN próbálkozásokra (DoS védelem)
-  // req.ip: az Express a 'trust proxy' beállítás szerint számolja (alapból a socket címe;
-  // proxy mögött a megbízható láncban jobbról számított első nem megbízható cím).
-  // Az X-Forwarded-For bal szélső (kliens által megadott) eleme SOHA nem számít.
+  // req.ip-t használunk, amelyet az Express a megbízható proxyláncból számít ki
   const clientIp = req.ip || req.socket?.remoteAddress || 'unknown-client';
 
   const now = Date.now();
@@ -548,7 +531,15 @@ app.post('/api/audit/recovery', (req, res) => {
       if (ts.every((t) => now - t >= 15 * 60 * 1000)) failedRecoveryAttemptsMap.delete(ip);
     }
   }
-  const clientFailures = (failedRecoveryAttemptsMap.get(clientIp) || []).filter((t) => now - t < 15 * 60 * 1000);
+
+  const rawFailures = failedRecoveryAttemptsMap.get(clientIp) || [];
+  const clientFailures = rawFailures.filter((t) => now - t < 15 * 60 * 1000);
+
+  if (clientFailures.length === 0) {
+    failedRecoveryAttemptsMap.delete(clientIp);
+  } else if (clientFailures.length !== rawFailures.length) {
+    failedRecoveryAttemptsMap.set(clientIp, clientFailures);
+  }
 
   if (clientFailures.length >= 3) {
     return res.status(429).json({
