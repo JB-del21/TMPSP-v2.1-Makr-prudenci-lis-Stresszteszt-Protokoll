@@ -24,6 +24,7 @@ import {
   TrustAnchor,
   GENESIS_PREV_HASH,
 } from './src/engine/cryptoNode.ts';
+import { EnvOrFileExternalTrustAnchorAdapter } from './src/engine/externalTrustAnchor.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -279,14 +280,27 @@ function initializeFreshLedgerAndAnchor(): void {
   };
   fs.writeFileSync(getSYSTEM_INIT_MARKER_FILE(), JSON.stringify(systemInitMarker, null, 2), 'utf8');
 
+  // Külső bizalmi horgony regisztrációja, ha konfigurálva van (AUD-008)
+  if (externalTrustAnchorAdapter.isConfigured()) {
+    externalTrustAnchorAdapter.registerExternalInitialization({
+      systemId: 'TMPSP-MAIN',
+      initializedAt: new Date().toISOString(),
+      environment: process.env.NODE_ENV || 'development',
+      status: 'INITIALIZED',
+      signature: '',
+    }).catch(() => {});
+  }
+
   serverIntegrityState = 'OPERATIONAL';
   lastIntegrityError = null;
   lastIntegrityErrorCode = null;
 }
 
+const externalTrustAnchorAdapter = new EnvOrFileExternalTrustAnchorAdapter();
+
 /**
- * Rendszerindulási integritás-ellenőrzés (AUD-001 & AUD-004 KÖVETELMÉNY)
- * Ha az audit-ledger hiányzik, de a rendszer már inicializálva volt (system-init.json),
+ * Rendszerindulási integritás-ellenőrzés (AUD-001, AUD-004 & AUD-008 KÖVETELMÉNY)
+ * Ha az audit-ledger hiányzik, de a rendszer már inicializálva volt (system-init.json vagy external trust anchor),
  * vagy ha a bizalmi horgony / karantén megvan, a szerver TOTAL_DATASTORE_CORRUPTED vagy
  * LEDGER_FILE_MISSING hibával karanténba lép és megtagadja az automatikus re-seedelést!
  */
@@ -297,11 +311,27 @@ function startupIntegrityCheck(): void {
   const quarantineExists = fs.existsSync(getQUARANTINE_INCIDENT_FILE());
   const initMarkerExists = fs.existsSync(getSYSTEM_INIT_MARKER_FILE());
 
-  // AUD-001 & AUD-004: Ha az audit napló hiányzik, de a rendszer már inicializálva volt
-  // vagy a bizalmi horgony/karantén feljegyzés létezik: AZONNAL KARANTÉN!
-  if (!ledgerExists && (anchorExists || quarantineExists || initMarkerExists)) {
+  let extInitialized = false;
+  if (externalTrustAnchorAdapter.isConfigured()) {
+    try {
+      if (process.env.TMPSP_EXTERNAL_REGISTRY_FILE && fs.existsSync(process.env.TMPSP_EXTERNAL_REGISTRY_FILE)) {
+        const content = fs.readFileSync(process.env.TMPSP_EXTERNAL_REGISTRY_FILE, 'utf8');
+        const parsed = JSON.parse(content);
+        if (parsed && parsed.systemId === 'TMPSP-MAIN' && parsed.status === 'INITIALIZED') {
+          extInitialized = true;
+        }
+      }
+    } catch {}
+  }
+
+  // AUD-001, AUD-004 & AUD-008: Ha az audit napló hiányzik, de a rendszer már inicializálva volt
+  // vagy a bizalmi horgony/karantén/külső regiszter létezik: AZONNAL KARANTÉN!
+  if (!ledgerExists && (anchorExists || quarantineExists || initMarkerExists || extInitialized)) {
     serverIntegrityState = 'INTEGRITY_FAILURE';
-    if (initMarkerExists && !anchorExists && !quarantineExists) {
+    if (extInitialized) {
+      lastIntegrityErrorCode = 'TOTAL_DATASTORE_CORRUPTED_EXTERNAL_VERIFIED';
+      lastIntegrityError = 'A külső bizalmi horgony (external trust anchor) igazolja, hogy a rendszer korábban már inicializálva volt, de a helyi audit napló hiányzik! Teljes adattár törlés vagy szabotázs észlelve.';
+    } else if (initMarkerExists && !anchorExists && !quarantineExists) {
       lastIntegrityErrorCode = 'TOTAL_DATASTORE_CORRUPTED';
       lastIntegrityError = 'A rendszer korábban már inicializálva volt (system-init.json létezik), de az audit napló és a bizalmi horgony hiányzik! Teljes adattár törlés vagy korrupció észlelve.';
     } else if (!anchorExists) {
@@ -317,7 +347,7 @@ function startupIntegrityCheck(): void {
   }
 
   // Kizárólag teljesen szűz, még sosem inicializált telepítés esetén hozható létre kezdeti seed
-  if (!ledgerExists && !anchorExists && !initMarkerExists) {
+  if (!ledgerExists && !anchorExists && !initMarkerExists && !extInitialized) {
     initializeFreshLedgerAndAnchor();
     return;
   }
@@ -607,14 +637,36 @@ export interface ForensicManifest {
 }
 
 /**
- * Forenzikus archívum létrehozása az ÖSSZES bizonyítékfájlból (AUD-007)
+ * Forenzikus archívum létrehozása az ÖSSZES bizonyítékfájlból (AUD-007 & AUD-007-FIX-02)
+ * Egyedi, felülírást kizáró könyvtárlétrehozás atomic fs.mkdirSync használatával.
  */
 function createForensicBundle(): { bundleDir: string; bundleName: string; manifestPath: string; manifestData: ForensicManifest } {
   ensureDataDirExists();
-  const archiveTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const bundleName = `archived-forensic-bundle-${archiveTimestamp}`;
-  const bundleDir = path.resolve(getDATA_DIR(), bundleName);
-  fs.mkdirSync(bundleDir, { recursive: true });
+  
+  let bundleCreated = false;
+  let attempts = 0;
+  let bundleName = '';
+  let bundleDir = '';
+
+  while (!bundleCreated && attempts < 10) {
+    attempts++;
+    const archiveTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const randomSuffix = crypto.randomBytes(4).toString('hex');
+    bundleName = `archived-forensic-bundle-${archiveTimestamp}-${randomSuffix}`;
+    bundleDir = path.resolve(getDATA_DIR(), bundleName);
+
+    try {
+      fs.mkdirSync(bundleDir); // Atomic kizárólagos könyvtárlétrehozás (AUD-007-FIX-02)
+      bundleCreated = true;
+    } catch (err: any) {
+      if (err.code === 'EEXIST') continue;
+      throw err;
+    }
+  }
+
+  if (!bundleCreated) {
+    throw new Error('FORENSIC_BUNDLE_CREATION_FAILED: Nem sikerült ütközésmentes bizonyítékkönyvtárat létrehozni.');
+  }
 
   const dataDir = getDATA_DIR();
   const allFilesInDir = fs.readdirSync(dataDir, { withFileTypes: true });
@@ -674,7 +726,7 @@ function createForensicBundle(): { bundleDir: string; bundleName: string; manife
 }
 
 /**
- * Forenzikus archívum szigorú, fail-closed pre-recovery ellenőrzése (AUD-007)
+ * Forenzikus archívum szigorú, fail-closed pre-recovery ellenőrzése (AUD-007 & AUD-007-FIX-01)
  */
 function verifyForensicBundle(bundleDir: string, manifestPath: string): { isValid: boolean; error?: string } {
   if (!fs.existsSync(bundleDir)) {
@@ -702,6 +754,14 @@ function verifyForensicBundle(bundleDir: string, manifestPath: string): { isVali
       return { isValid: false, error: 'Hiányzó vagy érvénytelen relativePath a manifestben.' };
     }
 
+    // AUD-007-FIX-01: READ_ERROR státuszú bejegyzés KÖTELEZŐEN érvényteleníti a csomagot!
+    if (entry.statusAtArchiving !== 'EXISTING') {
+      return {
+        isValid: false,
+        error: `READ_ERROR_IN_MANIFEST: A csomag '${entry.relativePath}' fájljának olvasása sikertelen volt az archiváláskor (statusAtArchiving: '${entry.statusAtArchiving}'). A hiányos bizonyítékcsomag miatt a recovery elutasítva.`,
+      };
+    }
+
     if (path.isAbsolute(entry.relativePath) || entry.relativePath.includes('..')) {
       return { isValid: false, error: `Útvonalbejárási kísérlet (Path Traversal) detektálva: ${entry.relativePath}` };
     }
@@ -711,25 +771,23 @@ function verifyForensicBundle(bundleDir: string, manifestPath: string): { isVali
     }
     seenPaths.add(entry.relativePath);
 
-    if (entry.statusAtArchiving === 'EXISTING') {
-      const fileInBundle = path.resolve(bundleDir, entry.relativePath);
-      if (!fileInBundle.startsWith(bundleDir)) {
-        return { isValid: false, error: `Bundle-en kívülre mutató hivatkozás: ${entry.relativePath}` };
-      }
+    const fileInBundle = path.resolve(bundleDir, entry.relativePath);
+    if (!fileInBundle.startsWith(bundleDir)) {
+      return { isValid: false, error: `Bundle-en kívülre mutató hivatkozás: ${entry.relativePath}` };
+    }
 
-      if (!fs.existsSync(fileInBundle)) {
-        return { isValid: false, error: `Az archivált fájl hiányzik a bundle mappából: ${entry.relativePath}` };
-      }
+    if (!fs.existsSync(fileInBundle)) {
+      return { isValid: false, error: `Az archivált fájl hiányzik a bundle mappából: ${entry.relativePath}` };
+    }
 
-      const rawBuffer = fs.readFileSync(fileInBundle);
-      if (rawBuffer.length !== entry.fileSize) {
-        return { isValid: false, error: `Fájlméret eltérés (${entry.relativePath}): elvárt ${entry.fileSize} B, kapott ${rawBuffer.length} B` };
-      }
+    const rawBuffer = fs.readFileSync(fileInBundle);
+    if (rawBuffer.length !== entry.fileSize) {
+      return { isValid: false, error: `Fájlméret eltérés (${entry.relativePath}): elvárt ${entry.fileSize} B, kapott ${rawBuffer.length} B` };
+    }
 
-      const actualHash = crypto.createHash('sha256').update(rawBuffer).digest('hex');
-      if (actualHash !== entry.sha256) {
-        return { isValid: false, error: `SHA-256 hash eltérés (${entry.relativePath}): elvárt ${entry.sha256}, kapott ${actualHash}` };
-      }
+    const actualHash = crypto.createHash('sha256').update(rawBuffer).digest('hex');
+    if (actualHash !== entry.sha256) {
+      return { isValid: false, error: `SHA-256 hash eltérés (${entry.relativePath}): elvárt ${entry.sha256}, kapott ${actualHash}` };
     }
   }
 

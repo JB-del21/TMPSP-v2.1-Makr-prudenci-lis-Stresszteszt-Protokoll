@@ -647,6 +647,66 @@ async function runApiIntegrationTests(): Promise<void> {
         vart: 'isConfigured = false, error contains BLOCKED_EXTERNAL_TRUST_ANCHOR',
         kapott: `isConfigured = ${!extUnconfigured}, err = ${extVerifyUnconf.error}`,
       });
+
+      // 26. CI-002-RERR: READ_ERROR státuszú bejegyzés a manifestben -> Fail-Closed elutasítás (AUD-007-FIX-01)
+      const testRerrDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-rerr-'));
+      process.env.TMPSP_DATA_DIR = testRerrDir;
+      try {
+        initializeFreshLedgerAndAnchor();
+        recordQuarantineIncident('ERR_READ', 0, 'Read error test');
+
+        const bundleRes = createForensicBundle();
+        // Módosítsuk a manifestet, mintha az egyik fájl olvasása sikertelen lett volna (statusAtArchiving: READ_ERROR)
+        const manifestContent = JSON.parse(fs.readFileSync(bundleRes.manifestPath, 'utf8'));
+        if (manifestContent.files && manifestContent.files.length > 0) {
+          manifestContent.files[0].statusAtArchiving = 'READ_ERROR';
+          fs.writeFileSync(bundleRes.manifestPath, JSON.stringify(manifestContent, null, 2), 'utf8');
+        }
+
+        const verifyReadErr = verifyForensicBundle(bundleRes.bundleDir, bundleRes.manifestPath);
+
+        apiResults.push({
+          id: 'CI-002-RERR',
+          nev: 'AUD-007-FIX-01: READ_ERROR Státuszú Bejegyzés Szigorú Elutasítása (Fail-Closed Recovery)',
+          sikeres: !verifyReadErr.isValid && Boolean(verifyReadErr.error?.includes('READ_ERROR_IN_MANIFEST')),
+          vart: 'isValid = false, READ_ERROR_IN_MANIFEST elutasítás',
+          kapott: `isValid = ${verifyReadErr.isValid}, error = ${verifyReadErr.error}`,
+        });
+      } finally {
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testRerrDir, { recursive: true, force: true }); } catch {}
+      }
+
+      // 27. CI-002-SIG: Külső bizalmi horgony HMAC digitális aláírás igazolás és ellenőrzés (AUD-008-FIX-01)
+      const testExtFile = path.join(os.tmpdir(), `tmpsp-ext-registry-${Date.now()}.json`);
+      try {
+        const fileExtAdapter = new EnvOrFileExternalTrustAnchorAdapter(testExtFile, 'test-hmac-secret-key');
+        const regRes = await fileExtAdapter.registerExternalInitialization({
+          systemId: 'TMPSP-MAIN',
+          initializedAt: new Date().toISOString(),
+          environment: 'test',
+          status: 'INITIALIZED',
+          signature: '',
+        });
+        const verifyExtValid = await fileExtAdapter.verifyExternalInitialization('TMPSP-MAIN');
+
+        // Módosítsuk a regiszterfájlt hamisított aláírás teszteléséhez
+        const rawReg = JSON.parse(fs.readFileSync(testExtFile, 'utf8'));
+        rawReg.signature = 'FORGED_SIGNATURE';
+        fs.writeFileSync(testExtFile, JSON.stringify(rawReg, null, 2), 'utf8');
+
+        const verifyExtForged = await fileExtAdapter.verifyExternalInitialization('TMPSP-MAIN');
+
+        apiResults.push({
+          id: 'CI-002-SIG',
+          nev: 'AUD-008-FIX-01: Külső Bizalmi Horgony HMAC Aláírás Alapú Hitelesítése és Hamisítás-Detektálása',
+          sikeres: regRes.success && verifyExtValid.isInitialized && !verifyExtForged.isInitialized && Boolean(verifyExtForged.error?.includes('SIGNATURE_INVALID')),
+          vart: 'regRes = true, validSig = true, forgedSig = false',
+          kapott: `reg = ${regRes.success}, valid = ${verifyExtValid.isInitialized}, forged = ${verifyExtForged.isInitialized}, err = ${verifyExtForged.error}`,
+        });
+      } finally {
+        try { fs.unlinkSync(testExtFile); } catch {}
+      }
     } finally {
       try { fs.rmSync(childDir, { recursive: true, force: true }); } catch {}
     }
