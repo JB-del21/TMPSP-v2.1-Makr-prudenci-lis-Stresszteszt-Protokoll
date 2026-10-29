@@ -360,11 +360,9 @@ function initializeFreshLedgerAndAnchor(): void {
 
 /**
  * Rendszerindulási integritás-ellenőrzés (AUD-001, AUD-004 & AUD-008 KÖVETELMÉNY)
- * Ha az audit-ledger hiányzik, de a rendszer már inicializálva volt (system-init.json vagy external trust anchor),
- * vagy ha a bizalmi horgony / karantén megvan, a szerver TOTAL_DATASTORE_CORRUPTED vagy
- * LEDGER_FILE_MISSING hibával karanténba lép és megtagadja az automatikus re-seedelést!
+ * Aszinkron implementáció: külső URL vagy fájl alapú bizalmi horgony hálózati/szigorú ellenőrzésével.
  */
-function startupIntegrityCheck(): void {
+async function startupIntegrityCheck(): Promise<void> {
   ensureDataDirExists();
   reconcileQuarantineIncidents();
 
@@ -378,8 +376,8 @@ function startupIntegrityCheck(): void {
   let extError: string | undefined;
 
   if (externalTrustAnchorAdapter.isConfigured()) {
-    const extResult = externalTrustAnchorAdapter.verifyExternalInitializationSync('TMPSP-MAIN');
-    if (extResult.error?.includes('EXTERNAL_TRUST_ANCHOR_SIGNATURE_INVALID')) {
+    const extResult = await externalTrustAnchorAdapter.verifyExternalInitialization('TMPSP-MAIN');
+    if (extResult.error?.includes('EXTERNAL_TRUST_ANCHOR_SIGNATURE_INVALID') || extResult.error?.includes('EXTERNAL_TRUST_ANCHOR_HTTP_ERROR') || extResult.error?.includes('EXTERNAL_TRUST_ANCHOR_NETWORK_FAILURE')) {
       extSignatureInvalid = true;
       extError = extResult.error;
     } else if (extResult.isInitialized) {
@@ -387,13 +385,13 @@ function startupIntegrityCheck(): void {
     }
   }
 
-  // HMAC Aláírás hamisításának észlelése a külső bizalmi horgonyban
+  // HMAC Aláírás hamisításának vagy hálózati/külső horgony hiba észlelése
   if (extSignatureInvalid) {
     serverIntegrityState = 'INTEGRITY_FAILURE';
     lastIntegrityErrorCode = 'EXTERNAL_TRUST_ANCHOR_SIGNATURE_INVALID';
-    lastIntegrityError = extError || 'A külső horgony digitális aláírása érvénytelen!';
+    lastIntegrityError = extError || 'A külső horgony digitális aláírása vagy hálózati érvényesítése sikertelen!';
     recordQuarantineIncident(lastIntegrityErrorCode, null, lastIntegrityError);
-    console.error(`CRITICAL ALARM: EXTERNAL TRUST ANCHOR FORGED! [${lastIntegrityErrorCode}]`);
+    console.error(`CRITICAL ALARM: EXTERNAL TRUST ANCHOR VERIFICATION FAILED! [${lastIntegrityErrorCode}]`);
     return;
   }
 
@@ -468,7 +466,7 @@ function startupIntegrityCheck(): void {
   }
 }
 
-startupIntegrityCheck();
+await startupIntegrityCheck();
 
 // Middleware: Operátori jogosultság ellenőrzése írási műveletekhez (API-001) timing-safe módon
 function requireOperatorAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
@@ -936,6 +934,15 @@ app.post('/api/audit/recovery', async (req, res) => {
   failedRecoveryAttemptsMap.delete(clientIp);
 
   try {
+    // 0. Külső bizalmi horgony ELŐZETES pre-check, mielőtt bármilyen helyi változtatást végeznénk (Transactional Recovery pre-check)
+    if (externalTrustAnchorAdapter.isConfigured()) {
+      const preCheckExt = await externalTrustAnchorAdapter.verifyExternalInitialization('TMPSP-MAIN');
+      // Ha a külső horgony hálózati vagy aláírási hibát ad, utasítsuk el a recovery-t MIELETT a helyi lánc törlődne
+      if (preCheckExt.error && (preCheckExt.error.includes('SIGNATURE_INVALID') || preCheckExt.error.includes('HTTP_ERROR') || preCheckExt.error.includes('NETWORK_FAILURE'))) {
+        throw new Error(`EXTERNAL_TRUST_ANCHOR_PRECHECK_FAILED: A külső horgony előzetes ellenőrzése sikertelen (${preCheckExt.error}). Helyi állapot változatlanul megőrizve.`);
+      }
+    }
+
     // 1. Forenzikus csomag létrehozása az ÖSSZES bizonyítékfájlból (AUD-007)
     const bundleInfo = createForensicBundle();
 
@@ -947,10 +954,7 @@ app.post('/api/audit/recovery', async (req, res) => {
 
     console.log(`[TMPSP AUDIT RECOVERY] Teljes állapoti bizonyíték archiválva és visszaellenőrizve: ${bundleInfo.bundleDir}`);
 
-    // 3. KIZÁRÓLAG sikeres archiválás és visszaellenőrzés után inicializálható az új tiszta napló!
-    initializeFreshLedgerAndAnchor();
-
-    // 4. Külső bizalmi horgony frissítése és igazolása (AUD-008)
+    // 3. Külső bizalmi horgony regisztráció Előkészítése (Commit előtt)
     if (externalTrustAnchorAdapter.isConfigured()) {
       const regRes = await externalTrustAnchorAdapter.registerExternalInitialization({
         systemId: 'TMPSP-MAIN',
@@ -966,7 +970,13 @@ app.post('/api/audit/recovery', async (req, res) => {
         lastIntegrityError = regRes.error || 'A külső bizalmi horgony frissítése elutasítva.';
         throw new Error(`EXTERNAL_TRUST_ANCHOR_UPDATE_FAILED: ${regRes.error}`);
       }
+    }
 
+    // 4. KIZÁRÓLAG minden előzetes külső és belső ellenőrzés után hajtódik végre a helyi commit (újrainicializálás)!
+    initializeFreshLedgerAndAnchor();
+
+    // 5. Utólagos külső bizalmi horgony visszaellenőrzés
+    if (externalTrustAnchorAdapter.isConfigured()) {
       const extVer = await externalTrustAnchorAdapter.verifyExternalInitialization('TMPSP-MAIN');
       if (!extVer.isInitialized) {
         serverIntegrityState = 'INTEGRITY_FAILURE';
