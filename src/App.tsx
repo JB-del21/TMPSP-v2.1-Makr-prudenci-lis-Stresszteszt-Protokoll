@@ -25,7 +25,7 @@ import { evaluateIntegratedStateMachine } from './engine/stateMachine';
 import { generateThresholdCalibrationRegister } from './engine/calibration';
 import { runAllEngineTests } from './engine/testSuite';
 import { exportCsvStream, exportTmpspToExcel } from './utils/exportXlsx';
-import { IndicatorCalculationResult, QuarterDataRow, ModuleId } from './engine/types';
+import { IndicatorCalculationResult, QuarterDataRow, ModuleId, DataOrigin } from './engine/types';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('dashboard');
@@ -33,6 +33,8 @@ export default function App() {
   const [quarterlyData, setQuarterlyData] = useState<QuarterDataRow[]>(INITIAL_QUARTERLY_DATA);
   const [metadata, setMetadata] = useState(MEASUREMENT_SERIES_META);
   const [auditLogs, setAuditLogs] = useState(INITIAL_AUDIT_LOGS);
+  // Operátori kulcs szigorúan csak memóriában (nem menthető localStorage/sessionStorage/URL/console-ba)
+  const [operatorKey, setOperatorKey] = useState<string>('');
 
   // Automata tesztek állapota
   const testResults = useMemo(() => runAllEngineTests(), []);
@@ -52,24 +54,115 @@ export default function App() {
     return calcs;
   }, [currentQuarter, quarterlyData, metadata]);
 
-  // Véges állapotgép döntési lefutása
+  // Negyedév adat-eredetének meghatározása a sorok eredet mezőjéből
+  const currentQuarterOrigin: DataOrigin = useMemo(() => {
+    const row = quarterlyData.find((r) => r.negyedev === currentQuarter);
+    if (row && row.eredet) {
+      return row.eredet;
+    }
+    if (currentQuarter === '2024Q1') return 'SZINTETIKUS_PILOT_2024Q1';
+    if (currentQuarter.startsWith('2025') || currentQuarter.startsWith('2026')) {
+      return 'PROJEKCIÓ_2025_2026';
+    }
+    return 'HISTÓRIKUS_BÁZIS_2023_2024';
+  }, [currentQuarter, quarterlyData]);
+
+  const isSynthetic = currentQuarterOrigin === 'SZINTETIKUS_PILOT_2024Q1';
+  const isProjection = currentQuarterOrigin === 'PROJEKCIÓ_2025_2026';
+
+  // Véges állapotgép döntési lefutása az eredet alapján
   const integratedState = useMemo(() => {
-    const isSynthetic = currentQuarter === '2024Q1';
-    return evaluateIntegratedStateMachine(currentQuarter, indicatorCalcs, isSynthetic);
-  }, [currentQuarter, indicatorCalcs]);
+    return evaluateIntegratedStateMachine(currentQuarter, indicatorCalcs, currentQuarterOrigin);
+  }, [currentQuarter, indicatorCalcs, currentQuarterOrigin]);
 
   // Küszöb-kalibrációs nyilvántartás (2023Q1–2024Q4 bázison)
   const calibrationData = useMemo(() => {
     return generateThresholdCalibrationRegister(metadata, quarterlyData);
   }, [metadata, quarterlyData]);
 
-  // Sor adat módosítása
-  const handleUpdateRow = (updatedRow: QuarterDataRow) => {
-    setQuarterlyData((prev) =>
-      prev.map((r) =>
-        r.negyedev === updatedRow.negyedev && r.sorId === updatedRow.sorId ? updatedRow : r
-      )
-    );
+  // Sor adat módosítása SZIGORÚAN csak sikeres POST /api/audit után
+  const handleUpdateRow = async (
+    updatedRow: QuarterDataRow,
+    oldRow: QuarterDataRow,
+    newCalculatedValue: number | null
+  ): Promise<{ success: boolean; error?: string }> => {
+    if (!operatorKey || !operatorKey.trim()) {
+      return {
+        success: false,
+        error: 'HIÁNYZÓ_KULCS: Adatmódosítás csak érvényes operátori kulccsal (Bearer hitelesítés) naplózható.',
+      };
+    }
+
+    const bemenetiPayload = {
+      negyedev: updatedRow.negyedev,
+      sorId: updatedRow.sorId,
+      regi: {
+        szamlalo: oldRow.szamlaloErtek ?? null,
+        nevezo: oldRow.nevezoErtek ?? null,
+        szamitott: oldRow.szamitottErtek ?? null,
+      },
+      uj: {
+        szamlalo: updatedRow.szamlaloErtek ?? null,
+        nevezo: updatedRow.nevezoErtek ?? null,
+        szamitott: newCalculatedValue,
+      },
+    };
+
+    try {
+      const res = await fetch('/api/audit', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${operatorKey.trim()}`,
+        },
+        body: JSON.stringify({
+          negyedev: updatedRow.negyedev,
+          esemenyTipus: 'KORREKCIÓ',
+          kepletVerzio: 'v2.1-correction',
+          elozetesHipotezis: `Adatmódosítás és korrekció rögzítése a(z) ${updatedRow.sorId} mérési sorban (${updatedRow.negyedev}).`,
+          nullhipotezis: 'Nincs mérési eltérés a korábbi értékekhez képest.',
+          mertEltérés: `Számláló: ${oldRow.szamlaloErtek ?? 'n.a.'} -> ${updatedRow.szamlaloErtek ?? 'n.a.'}, Nevező: ${oldRow.nevezoErtek ?? 'n.a.'} -> ${updatedRow.nevezoErtek ?? 'n.a.'}`,
+          döntésiEredmény: `Auditált korrekció jóváhagyva. Új számított érték: ${newCalculatedValue ?? 'n.a.'}`,
+          felelős: 'Operátori Adatmódosítás',
+          bemenetiPayload,
+        }),
+      });
+
+      if (!res.ok) {
+        let errorMsg = `HTTP ${res.status}`;
+        try {
+          const errData = await res.json();
+          if (errData && errData.error) {
+            errorMsg = `HTTP ${res.status}: ${errData.error}`;
+          }
+        } catch {
+          const rawText = await res.text();
+          if (rawText) errorMsg = `HTTP ${res.status}: ${rawText}`;
+        }
+        return { success: false, error: errorMsg };
+      }
+
+      const resData = await res.json();
+      if (resData.record) {
+        setAuditLogs((prev) => [...prev, resData.record]);
+      }
+
+      // CSAK sikeres válasz esetén frissítjük a state-et:
+      setQuarterlyData((prev) =>
+        prev.map((r) =>
+          r.negyedev === updatedRow.negyedev && r.sorId === updatedRow.sorId
+            ? { ...updatedRow, szamitottErtek: newCalculatedValue !== null ? newCalculatedValue : updatedRow.szamitottErtek }
+            : r
+        )
+      );
+
+      return { success: true };
+    } catch (err: any) {
+      return {
+        success: false,
+        error: `Hálózati hiba: ${err?.message || 'Nem sikerült elérni az audit szervert.'}`,
+      };
+    }
   };
 
   // Pilot adatok visszaállítása
@@ -159,6 +252,8 @@ export default function App() {
         currentQuarter={currentQuarter}
         quarterlyData={quarterlyData}
         indicatorCalcs={indicatorCalcs}
+        operatorKey={operatorKey}
+        onOperatorKeyChange={setOperatorKey}
         onUpdateRow={handleUpdateRow}
         onResetPilotData={handleResetPilotData}
       />
@@ -182,7 +277,8 @@ export default function App() {
           currentQuarter={currentQuarter}
           onQuarterChange={setCurrentQuarter}
           globalStatus={integratedState.globalisStatusz}
-          isSynthetic={currentQuarter === '2024Q1'}
+          isSynthetic={isSynthetic}
+          isProjection={isProjection}
           onExportXlsx={handleExportXlsx}
           onExportCsv={handleExportCsv}
           activeViewTitle={getActiveViewTitle()}
@@ -220,6 +316,8 @@ export default function App() {
               <AuditView
                 initialLogs={auditLogs}
                 currentQuarter={currentQuarter}
+                operatorKey={operatorKey}
+                onOperatorKeyChange={setOperatorKey}
               />
             )}
 

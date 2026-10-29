@@ -16,6 +16,7 @@ interface HeaderProps {
   onQuarterChange: (q: string) => void;
   globalStatus: StateMachineStatus;
   isSynthetic: boolean;
+  isProjection?: boolean;
   onExportXlsx: () => void;
   onExportCsv: () => void;
   activeViewTitle: string;
@@ -26,6 +27,7 @@ export const Header: React.FC<HeaderProps> = ({
   onQuarterChange,
   globalStatus,
   isSynthetic,
+  isProjection = false,
   onExportXlsx,
   onExportCsv,
   activeViewTitle,
@@ -103,6 +105,12 @@ export const Header: React.FC<HeaderProps> = ({
         {isSynthetic && (
           <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-blue-950 text-blue-300 border border-blue-800 hidden md:inline">
             SZINTETIKUS PILOT
+          </span>
+        )}
+
+        {isProjection && (
+          <span className="text-[11px] font-mono font-bold px-2.5 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-600 shadow-sm animate-pulse">
+            PROJEKCIÓ – nem megfigyelés
           </span>
         )}
       </div>

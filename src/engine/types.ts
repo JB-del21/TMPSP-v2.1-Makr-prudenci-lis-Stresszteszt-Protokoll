@@ -101,6 +101,7 @@ export interface IntegratedStateResult {
   prioritasosAkcio: string;
   auditHash?: string;
   szintetikusFigyelmeztetes?: boolean;
+  projekcioFigyelmeztetes?: boolean;
 }
 
 export interface CalibrationItem {

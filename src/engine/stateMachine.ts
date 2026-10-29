@@ -4,6 +4,7 @@
  */
 
 import {
+  DataOrigin,
   IndicatorCalculationResult,
   IntegratedStateResult,
   ModuleEvaluationResult,
@@ -226,7 +227,8 @@ export function evaluateModule4(
 export function evaluateIntegratedStateMachine(
   negyedev: string,
   calcs: Record<string, IndicatorCalculationResult>,
-  isSyntheticPilot: boolean = false
+  originOrIsSynthetic: DataOrigin | boolean = false,
+  originArg?: DataOrigin
 ): IntegratedStateResult {
   const m1 = evaluateModule1(calcs);
   const m2 = evaluateModule2(calcs);
@@ -236,9 +238,26 @@ export function evaluateIntegratedStateMachine(
   const modulok = { M1: m1, M2: m2, M3: m3, M4: m4 };
   const figyelmeztetesek: string[] = [];
 
+  let isSynthetic = false;
+  let isProjection = false;
+
+  if (typeof originOrIsSynthetic === 'boolean') {
+    isSynthetic = originOrIsSynthetic;
+    if (originArg === 'PROJEKCIÓ_2025_2026') isProjection = true;
+    if (originArg === 'SZINTETIKUS_PILOT_2024Q1') isSynthetic = true;
+  } else if (typeof originOrIsSynthetic === 'string') {
+    if (originOrIsSynthetic === 'SZINTETIKUS_PILOT_2024Q1') isSynthetic = true;
+    if (originOrIsSynthetic === 'PROJEKCIÓ_2025_2026') isProjection = true;
+  }
+
   // Szintetikus megjelölés
-  if (isSyntheticPilot) {
+  if (isSynthetic) {
     figyelmeztetesek.push('SZINTETIKUS_PILOT: Az adatsor szimulált tesztadat, nem tekinthető valós hatósági megfigyelésnek.');
+  }
+
+  // Projekció megjelölés
+  if (isProjection) {
+    figyelmeztetesek.push('PROJEKCIÓ: ez nem megfigyelés, hanem előrebecslés');
   }
 
   // DRL hiányok
@@ -286,6 +305,7 @@ export function evaluateIntegratedStateMachine(
     figyelmeztetesek,
     szukKeresztmetszet,
     prioritasosAkcio,
-    szintetikusFigyelmeztetes: isSyntheticPilot,
+    szintetikusFigyelmeztetes: isSynthetic,
+    projekcioFigyelmeztetes: isProjection,
   };
 }

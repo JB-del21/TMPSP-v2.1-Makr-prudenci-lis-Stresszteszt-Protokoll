@@ -11,7 +11,9 @@ import {
   AlertTriangle,
   RotateCcw,
   Save,
-  HelpCircle
+  HelpCircle,
+  AlertOctagon,
+  Lock
 } from 'lucide-react';
 import {
   DataReadinessLevel,
@@ -30,7 +32,13 @@ interface ModuleViewProps {
   currentQuarter: string;
   quarterlyData: QuarterDataRow[];
   indicatorCalcs: Record<string, IndicatorCalculationResult>;
-  onUpdateRow: (row: QuarterDataRow) => void;
+  operatorKey?: string;
+  onOperatorKeyChange?: (k: string) => void;
+  onUpdateRow: (
+    updatedRow: QuarterDataRow,
+    oldRow: QuarterDataRow,
+    calculatedValue: number | null
+  ) => Promise<{ success: boolean; error?: string }>;
   onResetPilotData: () => void;
 }
 
@@ -42,6 +50,8 @@ export const ModuleView: React.FC<ModuleViewProps> = ({
   currentQuarter,
   quarterlyData,
   indicatorCalcs,
+  operatorKey = '',
+  onOperatorKeyChange,
   onUpdateRow,
   onResetPilotData,
 }) => {
@@ -50,6 +60,8 @@ export const ModuleView: React.FC<ModuleViewProps> = ({
   const [editNumerator, setEditNumerator] = useState<number>(0);
   const [editDenominator, setEditDenominator] = useState<number>(1);
   const [editDrl, setEditDrl] = useState<DataReadinessLevel>('IGAZOLT');
+  const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
+  const [isSavingRowId, setIsSavingRowId] = useState<string | null>(null);
 
   const startEdit = (row: QuarterDataRow) => {
     setEditingRowId(row.sorId);
@@ -58,13 +70,41 @@ export const ModuleView: React.FC<ModuleViewProps> = ({
     setEditDrl(row.drl);
   };
 
-  const saveEdit = (row: QuarterDataRow) => {
-    onUpdateRow({
+  const saveEdit = async (row: QuarterDataRow, meta: IndicatorMeta) => {
+    setIsSavingRowId(row.sorId);
+    setRowErrors((prev) => {
+      const next = { ...prev };
+      delete next[row.sorId];
+      return next;
+    });
+
+    let newCalculated: number | null = null;
+    if (meta.sorId === '1.1') {
+      newCalculated = editNumerator;
+    } else if (editDenominator !== 0) {
+      newCalculated = Number(((editNumerator / editDenominator) * 100).toFixed(4));
+    }
+
+    const updatedRow: QuarterDataRow = {
       ...row,
       szamlaloErtek: editNumerator,
       nevezoErtek: editDenominator,
+      szamitottErtek: newCalculated !== null ? newCalculated : undefined,
       drl: editDrl,
-    });
+    };
+
+    const result = await onUpdateRow(updatedRow, row, newCalculated);
+    setIsSavingRowId(null);
+
+    if (!result.success) {
+      setRowErrors((prev) => ({
+        ...prev,
+        [row.sorId]: result.error || 'A módosítás naplózása sikertelen.',
+      }));
+      // Nem zárjuk be a szerkesztőt, így nem vész el az érték!
+      return;
+    }
+
     setEditingRowId(null);
   };
 
@@ -284,19 +324,57 @@ export const ModuleView: React.FC<ModuleViewProps> = ({
                       </div>
                     </div>
 
+                    {/* Operátori kulcs beviteli mező, ha még nincs megadva */}
+                    {(!operatorKey || operatorKey.trim() === '') && (
+                      <div className="bg-slate-900/90 border border-amber-600/60 rounded-lg p-2.5">
+                        <label className="text-[11px] font-semibold text-amber-300 flex items-center gap-1.5 mb-1">
+                          <Lock className="w-3.5 h-3.5 text-amber-400" />
+                          Operátori kulcs (WORM naplózáshoz kötelező):
+                        </label>
+                        <input
+                          type="password"
+                          autoComplete="off"
+                          value={operatorKey}
+                          onChange={(e) => onOperatorKeyChange?.(e.target.value)}
+                          placeholder="Adja meg az operátori kulcsot (csak memóriában tárolva)..."
+                          className="w-full bg-slate-950 border border-amber-700 rounded px-2.5 py-1 text-xs text-white font-mono placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-amber-500"
+                        />
+                      </div>
+                    )}
+
+                    {/* Hibaüzenet, ha a POST /api/audit sikertelen volt */}
+                    {rowErrors[meta.sorId] && (
+                      <div className="p-2.5 bg-red-950/90 border border-red-700 rounded text-xs text-red-200 flex items-start gap-2">
+                        <AlertOctagon className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                        <div>
+                          <strong className="font-semibold block text-red-300">
+                            Adatmódosítás elutasítva (WORM naplózási hiba):
+                          </strong>
+                          <span className="font-mono text-[11px] text-red-200">
+                            {rowErrors[meta.sorId]}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+
                     <div className="flex items-center justify-end gap-2 pt-1">
                       <button
-                        onClick={() => setEditingRowId(null)}
+                        type="button"
+                        onClick={() => {
+                          setEditingRowId(null);
+                        }}
                         className="px-3 py-1.5 text-xs text-slate-400 hover:text-white transition-colors cursor-pointer"
                       >
                         Mégse
                       </button>
                       <button
-                        onClick={() => saveEdit(currentRow)}
-                        className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded transition-colors cursor-pointer"
+                        type="button"
+                        disabled={isSavingRowId === meta.sorId}
+                        onClick={() => saveEdit(currentRow, meta)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:cursor-not-allowed text-white text-xs font-semibold rounded transition-colors cursor-pointer"
                       >
-                        <Save className="w-3.5 h-3.5" />
-                        <span>Mentés és Újraszámítás</span>
+                        <Save className={`w-3.5 h-3.5 ${isSavingRowId === meta.sorId ? 'animate-spin' : ''}`} />
+                        <span>{isSavingRowId === meta.sorId ? 'Auditálás...' : 'Mentés és Újraszámítás'}</span>
                       </button>
                     </div>
                   </div>

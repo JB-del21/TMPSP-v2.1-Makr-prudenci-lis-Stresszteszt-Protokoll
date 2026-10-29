@@ -142,6 +142,42 @@ async function runApiIntegrationTests(): Promise<void> {
       kapott: trustFailures.length === 0 ? `${trustCases.length + 4} eset rendben` : trustFailures.join('; '),
     });
 
+    // UI-001: Kliens- és forráskód audit: tiltott hardcode-olt titkok keresése src/-ben
+    // (a tesztfájlokat és a runApiTestsCli.ts-t kivéve)
+    const forbiddenSecrets = ['tmpsp-operator-token', 'tmpsp-admin-recovery', 'tmpsp-secret-hmac'];
+    const secretViolations: string[] = [];
+    const scanDir = (dir: string) => {
+      const items = fs.readdirSync(dir, { withFileTypes: true });
+      for (const item of items) {
+        const full = path.join(dir, item.name);
+        if (item.isDirectory()) {
+          scanDir(full);
+        } else if (item.isFile() && (item.name.endsWith('.ts') || item.name.endsWith('.tsx'))) {
+          if (
+            item.name === 'runApiTestsCli.ts' ||
+            item.name === 'runTestsCli.ts' ||
+            item.name === 'testSuite.ts'
+          ) {
+            continue;
+          }
+          const content = fs.readFileSync(full, 'utf8');
+          for (const s of forbiddenSecrets) {
+            if (content.includes(s)) {
+              secretViolations.push(`${path.relative(ROOT_DIR, full)}: "${s}"`);
+            }
+          }
+        }
+      }
+    };
+    scanDir(path.resolve(ROOT_DIR, 'src'));
+    apiResults.push({
+      id: 'UI-001',
+      nev: 'Kliens- és forráskód audit: tilos a hardcode-olt operátori/admin/HMAC titok src/-ben',
+      sikeres: secretViolations.length === 0,
+      vart: '0 hardcode-olt titok az éles forráskódban',
+      kapott: secretViolations.length === 0 ? 'Minden forrásfájl tiszta' : secretViolations.join('; '),
+    });
+
     // 1. API-001: 401 Unauthorized hitelesítés nélküli írásnál
     const resAuthMissing = await makeRequest('POST', '/api/audit', {}, { negyedev: '2024Q1', esemenyTipus: 'PILOT', kepletVerzio: 'v2.1', felelős: 'MNB' });
     apiResults.push({

@@ -92,6 +92,35 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       )}
 
+      {/* Projekció Figyelmeztető Értesítés */}
+      {integratedState.projekcioFigyelmeztetes && (
+        <div className="p-4 bg-amber-950/60 border-2 border-amber-500 rounded-lg flex items-start justify-between gap-4 shadow-lg shadow-amber-950/40">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-black tracking-wider uppercase px-2 py-0.5 rounded bg-amber-500 text-black">
+                  PROJEKCIÓ – nem megfigyelés
+                </span>
+                <span className="text-xs font-semibold text-amber-200">
+                  Előrebecslési Időszak ({currentQuarter})
+                </span>
+              </div>
+              <p className="text-xs text-amber-300/90 mt-1.5 leading-relaxed font-medium">
+                FIGYELEM: Ez az időszak szimulált makrogazdasági előrebecslés (projekció), nem hatósági vagy piaci tényadat. A kalkulációk és a jelzett kockázatok hipotetikus stresszpályán alapulnak.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => onNavigateTab('scenarios')}
+            className="text-[11px] font-mono text-amber-300 hover:text-white flex items-center gap-1 shrink-0 px-2.5 py-1.5 bg-amber-900/60 rounded border border-amber-600 transition-colors cursor-pointer"
+          >
+            <span>Sokk-szcenáriók</span>
+            <ArrowRight className="w-3 h-3" />
+          </button>
+        </div>
+      )}
+
       {/* Állapotgép Vizuális Folyamatábra (Finite State Machine Visualizer) */}
       <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
         <div className="flex items-center justify-between mb-4">

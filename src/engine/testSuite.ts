@@ -40,7 +40,7 @@
 import { sha256Utf8 } from './sha256';
 import { canonicalJsonStringify, CanonicalJsonError } from './canonicalJson';
 import { calculateIndicatorValue } from './calculator';
-import { evaluateModule2 } from './stateMachine';
+import { evaluateModule2, evaluateIntegratedStateMachine } from './stateMachine';
 import { runThresholdBacktest } from './calibration';
 import {
   computeCanonicalRecordHash,
@@ -61,7 +61,8 @@ export type TestCategory =
   | 'PERZISZTENCIA'
   | 'ADATHIÁNY'
   | 'KALIBRÁCIÓ'
-  | 'WORM_INTEGRITÁS';
+  | 'WORM_INTEGRITÁS'
+  | 'ADAT_EREDET';
 
 export interface TestResult {
   id: string;
@@ -858,6 +859,50 @@ export function runAllEngineTests(): TestResult[] {
     sikeres: hmacMatchVerify.isValid && !hmacMismatchVerify.isValid && hmacMismatchVerify.errorCode === 'TRUST_ANCHOR_MISMATCH',
     vart: 'match = true, mismatch = TRUST_ANCHOR_MISMATCH',
     kapott: `match = ${hmacMatchVerify.isValid}, mismatchCode = ${hmacMismatchVerify.errorCode}`,
+  });
+
+  // DATA-001: Prognózis és Szintetikus Figyelmeztetések Eredet Alapján
+  const projEval = evaluateIntegratedStateMachine('2025Q1', {}, 'PROJEKCIÓ_2025_2026');
+  const synthEval = evaluateIntegratedStateMachine('2024Q1', {}, 'SZINTETIKUS_PILOT_2024Q1');
+
+  const projHasWarning = projEval.figyelmeztetesek.some((f) => f.includes('PROJEKCIÓ'));
+  const synthHasWarning = synthEval.figyelmeztetesek.some((f) => f.includes('SZINTETIKUS'));
+  const projNotSynth = !projEval.figyelmeztetesek.some((f) => f.includes('SZINTETIKUS'));
+  const data001Success =
+    projHasWarning &&
+    synthHasWarning &&
+    projNotSynth &&
+    projEval.projekcioFigyelmeztetes === true &&
+    synthEval.szintetikusFigyelmeztetes === true;
+
+  results.push({
+    id: 'DATA-001',
+    kategoria: 'ADAT_EREDET',
+    nev: 'Projekciós és Szintetikus Adateredet-Figyelmeztetés',
+    leiras: 'Projekciós sor (PROJEKCIÓ_2025_2026) kiértékelésekor a figyelmeztetésekben kötelezően szerepel a "PROJEKCIÓ", miközben a 2024Q1 szintetikus figyelmeztetése megmarad.',
+    sikeres: data001Success,
+    vart: 'projHasWarning = true, synthHasWarning = true, projNotSynth = true, flags helyesek',
+    kapott: `projHasWarning = ${projHasWarning}, synthHasWarning = ${synthHasWarning}, flags = [synth: ${synthEval.szintetikusFigyelmeztetes}, proj: ${projEval.projekcioFigyelmeztetes}]`,
+  });
+
+  // DATA-002: Valós Bázis Negyedévek Eredet-Tisztasága
+  const baseEval = evaluateIntegratedStateMachine('2023Q4', {}, 'HISTÓRIKUS_BÁZIS_2023_2024');
+  const baseHasProjWarning = baseEval.figyelmeztetesek.some((f) => f.includes('PROJEKCIÓ'));
+  const baseHasSynthWarning = baseEval.figyelmeztetesek.some((f) => f.includes('SZINTETIKUS'));
+  const data002Success =
+    !baseHasProjWarning &&
+    !baseHasSynthWarning &&
+    !baseEval.szintetikusFigyelmeztetes &&
+    !baseEval.projekcioFigyelmeztetes;
+
+  results.push({
+    id: 'DATA-002',
+    kategoria: 'ADAT_EREDET',
+    nev: 'Valós Bázis Negyedévek Tisztasága (Nincs Figyelmeztetés)',
+    leiras: 'Valós bázis negyedévekben (HISTÓRIKUS_BÁZIS_2023_2024) sem projekciós, sem szintetikus figyelmeztetés nem jelenhet meg.',
+    sikeres: data002Success,
+    vart: 'baseHasProj = false, baseHasSynth = false, mindkét flag false',
+    kapott: `baseHasProj = ${baseHasProjWarning}, baseHasSynth = ${baseHasSynthWarning}, flags = [synth: ${baseEval.szintetikusFigyelmeztetes}, proj: ${baseEval.projekcioFigyelmeztetes}]`,
   });
 
   return results;

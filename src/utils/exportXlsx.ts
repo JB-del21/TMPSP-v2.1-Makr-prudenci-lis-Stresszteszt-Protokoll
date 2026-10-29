@@ -84,14 +84,24 @@ export function exportTmpspToExcel(
   XLSX.utils.book_append_sheet(wb, wsCalib, 'Threshold_Calibration');
 
   // 6. Lap: Alert_State
-  const alertHeaders = ['Negyedév', 'Globális_Állapot', 'Modul_1', 'Modul_2', 'Modul_3', 'Modul_4', 'Szűk_Keresztmetszet', 'Prioritásos_Intézkedés'];
+  const alertHeaders = ['Negyedév', 'Adat_Eredete', 'Globális_Állapot', 'Modul_1', 'Modul_2', 'Modul_3', 'Modul_4', 'Szűk_Keresztmetszet', 'Prioritásos_Intézkedés'];
   const alertRows = [
-    ['2023Q1', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Nincs', 'Rutin monitoring'],
-    ['2023Q2', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'Kamatsokk és hozzáférési szűkülés', 'Banki elutasítási vizsgálat'],
-    ['2023Q3', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'Piaci likviditás mélypont', 'Fedezeti puffer felülvizsgálat'],
-    ['2023Q4', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Enyhülő nyomás', 'Rutin monitoring'],
-    ['2024Q1', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'ZÖLD', '550k-800k hozzáférés szűkülés, DOM olló', 'Kötelező 15 napos adategyeztetés KHR-rel és bankokkal'],
-    ['2024Q2', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Normalizálódó forgalom', 'Rutin monitoring'],
+    ['2023Q1', 'HISTÓRIKUS_BÁZIS_2023_2024', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Nincs', 'Rutin monitoring'],
+    ['2023Q2', 'HISTÓRIKUS_BÁZIS_2023_2024', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'Kamatsokk és hozzáférési szűkülés', 'Banki elutasítási vizsgálat'],
+    ['2023Q3', 'HISTÓRIKUS_BÁZIS_2023_2024', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'Piaci likviditás mélypont', 'Fedezeti puffer felülvizsgálat'],
+    ['2023Q4', 'HISTÓRIKUS_BÁZIS_2023_2024', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Enyhülő nyomás', 'Rutin monitoring'],
+    ['2024Q1', 'SZINTETIKUS_PILOT_2024Q1', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'ZÖLD', '550k-800k hozzáférés szűkülés, DOM olló', 'Kötelező 15 napos adategyeztetés KHR-rel és bankokkal'],
+    ['2024Q2', 'HISTÓRIKUS_BÁZIS_2023_2024', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Normalizálódó forgalom', 'Rutin monitoring'],
+    ['2024Q3', 'HISTÓRIKUS_BÁZIS_2023_2024', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Stabil hiteldinamika', 'Rutin monitoring'],
+    ['2024Q4', 'HISTÓRIKUS_BÁZIS_2023_2024', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Báziszárás és kalibrációs felülvizsgálat', 'Éves makroprudenciális jelentés'],
+    ['2025Q1', 'PROJEKCIÓ_2025_2026', 'SÁRGA - ELŐZETES', 'SÁRGA', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Előrejelzett JTM szigorodás', 'Modellkockázati monitoring'],
+    ['2025Q2', 'PROJEKCIÓ_2025_2026', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'ZÖLD', 'Projekciós DOM nyílás', 'Kockázati pályák futtatása'],
+    ['2025Q3', 'PROJEKCIÓ_2025_2026', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'Kedvezőtlen sokk pálya határán', 'Stresszteszt kalibráció'],
+    ['2025Q4', 'PROJEKCIÓ_2025_2026', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Stabilizálódó előrejelzés', 'Rutin projekciós monitoring'],
+    ['2026Q1', 'PROJEKCIÓ_2025_2026', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Projekciós bázis', 'Rutin monitoring'],
+    ['2026Q2', 'PROJEKCIÓ_2025_2026', 'SÁRGA - ELŐZETES', 'SÁRGA', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Előrejelzett hitelkereslet szűkülés', 'Banki hitelezési felmérés'],
+    ['2026Q3', 'PROJEKCIÓ_2025_2026', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'ZÖLD', 'Hipotetikus likviditási feszültség', 'Érzékenységi vizsgálat'],
+    ['2026Q4', 'PROJEKCIÓ_2025_2026', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Horizont zárása', 'Hosszú távú felülvizsgálat'],
   ];
   const wsAlert = XLSX.utils.aoa_to_sheet([alertHeaders, ...alertRows]);
   XLSX.utils.book_append_sheet(wb, wsAlert, 'Alert_State');
