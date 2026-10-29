@@ -707,6 +707,120 @@ async function runApiIntegrationTests(): Promise<void> {
       } finally {
         try { fs.unlinkSync(testExtFile); } catch {}
       }
+
+      // 28. CI-002-EMP-MAN: Üres manifest elutasítása (FORENSIC_MANIFEST_EMPTY)
+      const testEmpManDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-empman-'));
+      process.env.TMPSP_DATA_DIR = testEmpManDir;
+      try {
+        initializeFreshLedgerAndAnchor();
+        recordQuarantineIncident('ERR_EMP', 0, 'Empty manifest test');
+
+        const bundleRes = createForensicBundle();
+        const manifestContent = JSON.parse(fs.readFileSync(bundleRes.manifestPath, 'utf8'));
+        manifestContent.files = [];
+        fs.writeFileSync(bundleRes.manifestPath, JSON.stringify(manifestContent, null, 2), 'utf8');
+
+        const verifyEmp = verifyForensicBundle(bundleRes.bundleDir, bundleRes.manifestPath);
+
+        apiResults.push({
+          id: 'CI-002-EMP-MAN',
+          nev: 'AUD-007: Üres Manifest Elutasítása (FORENSIC_MANIFEST_EMPTY -> Fail-Closed)',
+          sikeres: !verifyEmp.isValid && Boolean(verifyEmp.error?.includes('FORENSIC_MANIFEST_EMPTY')),
+          vart: 'isValid = false, FORENSIC_MANIFEST_EMPTY elutasítás',
+          kapott: `isValid = ${verifyEmp.isValid}, error = ${verifyEmp.error}`,
+        });
+      } finally {
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testEmpManDir, { recursive: true, force: true }); } catch {}
+      }
+
+      // 29. CI-002-INC-MAN: Hiányos manifest elutasítása (Hiányzó kötelező audit-ledger.jsonl)
+      const testIncManDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-incman-'));
+      process.env.TMPSP_DATA_DIR = testIncManDir;
+      try {
+        initializeFreshLedgerAndAnchor();
+        recordQuarantineIncident('ERR_INC', 0, 'Incomplete manifest test');
+
+        const bundleRes = createForensicBundle();
+        const manifestContent = JSON.parse(fs.readFileSync(bundleRes.manifestPath, 'utf8'));
+        manifestContent.files = manifestContent.files.filter((f: any) => !['audit-ledger.jsonl', 'system-init.json', 'quarantine-incidents.jsonl', 'trust-anchor.json'].includes(f.relativePath) && !f.relativePath.startsWith('quarantine-incident-'));
+        fs.writeFileSync(bundleRes.manifestPath, JSON.stringify(manifestContent, null, 2), 'utf8');
+
+        const verifyInc = verifyForensicBundle(bundleRes.bundleDir, bundleRes.manifestPath);
+
+        apiResults.push({
+          id: 'CI-002-INC-MAN',
+          nev: 'AUD-007: Bizonyítékfájlokat Hiányoló Manifest Elutasítása (FORENSIC_MANIFEST_INCOMPLETE)',
+          sikeres: !verifyInc.isValid && Boolean(verifyInc.error?.includes('FORENSIC_MANIFEST_INCOMPLETE')),
+          vart: 'isValid = false, FORENSIC_MANIFEST_INCOMPLETE elutasítás',
+          kapott: `isValid = ${verifyInc.isValid}, error = ${verifyInc.error}`,
+        });
+      } finally {
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testIncManDir, { recursive: true, force: true }); } catch {}
+      }
+
+      // 30. CI-002-UNL-MAN: Nem listázott plusz fájl a bundle mappában -> Elutasítás
+      const testUnlManDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-unlman-'));
+      process.env.TMPSP_DATA_DIR = testUnlManDir;
+      try {
+        initializeFreshLedgerAndAnchor();
+        recordQuarantineIncident('ERR_UNL', 0, 'Unlisted file test');
+
+        const bundleRes = createForensicBundle();
+        // Hozzunk létre egy nem listázott plusz fájlt a bundle mappában
+        fs.writeFileSync(path.join(bundleRes.bundleDir, 'unlisted-evidence.txt'), 'unlisted payload', 'utf8');
+
+        const verifyUnl = verifyForensicBundle(bundleRes.bundleDir, bundleRes.manifestPath);
+
+        apiResults.push({
+          id: 'CI-002-UNL-MAN',
+          nev: 'AUD-007: Nem Listázott Fájl a Csomagban -> Elutasítás (UNLISTED_FILE_IN_FORENSIC_BUNDLE)',
+          sikeres: !verifyUnl.isValid && Boolean(verifyUnl.error?.includes('UNLISTED_FILE_IN_FORENSIC_BUNDLE')),
+          vart: 'isValid = false, UNLISTED_FILE_IN_FORENSIC_BUNDLE elutasítás',
+          kapott: `isValid = ${verifyUnl.isValid}, error = ${verifyUnl.error}`,
+        });
+      } finally {
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testUnlManDir, { recursive: true, force: true }); } catch {}
+      }
+
+      // 31. CI-002-REC-ORPHAN: Elárvult incidensfájlok automatikus tranzakciós szinkronizálása és helyreállítása (AUD-006)
+      const testOrphanDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-orphan-'));
+      process.env.TMPSP_DATA_DIR = testOrphanDir;
+      try {
+        initializeFreshLedgerAndAnchor();
+        const orphanId = 'INC-2026-10-29T12-00-00-000Z-testorphan';
+        const orphanFile = path.join(testOrphanDir, `quarantine-incident-${orphanId}.json`);
+        const orphanData = {
+          incidentId: orphanId,
+          incidentTimestamp: '2026-10-29T12:00:00.000Z',
+          errorCode: 'TEST_ORPHAN_ERROR',
+          brokenIndex: 0,
+          reason: 'Orphaned file test',
+          ledgerPath: path.join(testOrphanDir, 'audit-ledger.jsonl'),
+          evidenceFilePath: `quarantine-incident-${orphanId}.json`,
+          action: 'QUARANTINE_MODE_ACTIVE',
+        };
+        fs.writeFileSync(orphanFile, JSON.stringify(orphanData, null, 2), 'utf8');
+
+        // Hívjuk meg a recordQuarantineIncident-et, amely lefuttatja a reconcileQuarantineIncidents-et
+        recordQuarantineIncident('ERR_NEW', 1, 'Trigger reconcile');
+
+        const jsonlContent = fs.readFileSync(path.join(testOrphanDir, 'quarantine-incidents.jsonl'), 'utf8');
+        const isOrphanRecovered = jsonlContent.includes(orphanId);
+
+        apiResults.push({
+          id: 'CI-002-REC-ORPHAN',
+          nev: 'AUD-006: Elárvult Incidensfájlok Automatikus Helyreállítása a JSONL Naplóba',
+          sikeres: isOrphanRecovered,
+          vart: 'isOrphanRecovered = true',
+          kapott: `isOrphanRecovered = ${isOrphanRecovered}`,
+        });
+      } finally {
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testOrphanDir, { recursive: true, force: true }); } catch {}
+      }
     } finally {
       try { fs.rmSync(childDir, { recursive: true, force: true }); } catch {}
     }

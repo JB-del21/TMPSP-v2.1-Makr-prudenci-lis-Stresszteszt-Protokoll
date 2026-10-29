@@ -110,8 +110,63 @@ function timingSafeCompare(a: string, b: string): boolean {
 }
 
 /**
+ * Reconciles orphaned quarantine incident evidence files on disk into quarantine-incidents.jsonl
+ * and updates the latest pointer quarantine-incident.json (AUD-006 transactionality & consistency).
+ */
+function reconcileQuarantineIncidents(): void {
+  ensureDataDirExists();
+  const dataDir = getDATA_DIR();
+  if (!fs.existsSync(dataDir)) return;
+
+  const files = fs.readdirSync(dataDir);
+  const incidentFiles = files.filter(f => f.startsWith('quarantine-incident-INC-') && f.endsWith('.json'));
+  if (incidentFiles.length === 0) return;
+
+  // Read existing logged incident IDs from jsonl
+  const jsonlFile = getQUARANTINE_INCIDENTS_LOG();
+  const existingIds = new Set<string>();
+  if (fs.existsSync(jsonlFile)) {
+    const lines = fs.readFileSync(jsonlFile, 'utf8').split('\n').filter(l => l.trim().length > 0);
+    for (const line of lines) {
+      try {
+        const item = JSON.parse(line);
+        if (item && item.incidentId) existingIds.add(item.incidentId);
+      } catch {}
+    }
+  }
+
+  let latestTimestamp = 0;
+  let latestData: any = null;
+
+  for (const fileName of incidentFiles) {
+    const filePath = path.resolve(dataDir, fileName);
+    try {
+      const content = fs.readFileSync(filePath, 'utf8');
+      const data = JSON.parse(content);
+      if (!data || !data.incidentId) continue;
+
+      const ts = Date.parse(data.incidentTimestamp || '') || 0;
+      if (ts > latestTimestamp) {
+        latestTimestamp = ts;
+        latestData = data;
+      }
+
+      if (!existingIds.has(data.incidentId)) {
+        fs.appendFileSync(jsonlFile, JSON.stringify(data) + '\n', 'utf8');
+        existingIds.add(data.incidentId);
+        console.log(`[TMPSP RECONCILE] Orphaned quarantine incident recovered into log: ${data.incidentId}`);
+      }
+    } catch {}
+  }
+
+  if (latestData) {
+    fs.writeFileSync(getQUARANTINE_INCIDENT_FILE(), JSON.stringify(latestData, null, 2), 'utf8');
+  }
+}
+
+/**
  * Incidens naplózása a quarantine-incident.json, quarantine-incidents.jsonl és egyedi, ütközésmentes
- * atomic bizonyítékfájlba (AUD-006: fs.openSync mit 'wx' flag).
+ * atomic bizonyítékfájlba (AUD-006: fs.openSync mit 'wx' flag + tranzakciós konzisztencia-helyreállítás).
  */
 function recordQuarantineIncident(errorCode: string, brokenIndex: number | null, reason: string): string {
   ensureDataDirExists();
@@ -146,7 +201,7 @@ function recordQuarantineIncident(errorCode: string, brokenIndex: number | null,
       fs.writeFileSync(uniqueFilePath, JSON.stringify(incidentData, null, 2), { flag: 'wx', encoding: 'utf8' });
       created = true;
 
-      // 1. Legutóbbi incidens mutatójának frissítése (gyorselérési segédlet, nem az elsődleges forrás)
+      // 1. Legutóbbi incidens mutatójának frissítése
       fs.writeFileSync(getQUARANTINE_INCIDENT_FILE(), JSON.stringify(incidentData, null, 2), 'utf8');
 
       // 2. Append-only napló (quarantine-incidents.jsonl) frissítése
@@ -155,14 +210,19 @@ function recordQuarantineIncident(errorCode: string, brokenIndex: number | null,
       if (err.code === 'EEXIST') {
         continue;
       }
+      // Tranzakciós egyeztetés az esetlegesen elárvult bizonyítékfájlok naplózásához
+      reconcileQuarantineIncidents();
       throw new Error(`INCIDENT_RECORDING_FAILED: Nem sikerült a bizonyítékfájl mentése (${err.message}).`);
     }
   }
 
   if (!created) {
+    reconcileQuarantineIncidents();
     throw new Error('INCIDENT_RECORDING_FAILED: Nem sikerült ütközésmentes bizonyítékfájlt létrehozni 10 próbálkozás után.');
   }
 
+  // Tranzakciós ellenőrzés és szinkronizáció
+  reconcileQuarantineIncidents();
   return incidentId;
 }
 
@@ -197,6 +257,8 @@ function readTrustAnchor(): TrustAnchor | null {
     return null;
   }
 }
+
+const externalTrustAnchorAdapter = new EnvOrFileExternalTrustAnchorAdapter();
 
 /**
  * Kezdeti auditnapló és bizalmi horgony kiépítése (KIZÁRÓLAG ÚJ RENDSZER INDULÁSAKOR)
@@ -282,21 +344,19 @@ function initializeFreshLedgerAndAnchor(): void {
 
   // Külső bizalmi horgony regisztrációja, ha konfigurálva van (AUD-008)
   if (externalTrustAnchorAdapter.isConfigured()) {
-    externalTrustAnchorAdapter.registerExternalInitialization({
+    externalTrustAnchorAdapter.registerExternalInitializationSync({
       systemId: 'TMPSP-MAIN',
       initializedAt: new Date().toISOString(),
       environment: process.env.NODE_ENV || 'development',
       status: 'INITIALIZED',
       signature: '',
-    }).catch(() => {});
+    });
   }
 
   serverIntegrityState = 'OPERATIONAL';
   lastIntegrityError = null;
   lastIntegrityErrorCode = null;
 }
-
-const externalTrustAnchorAdapter = new EnvOrFileExternalTrustAnchorAdapter();
 
 /**
  * Rendszerindulási integritás-ellenőrzés (AUD-001, AUD-004 & AUD-008 KÖVETELMÉNY)
@@ -306,22 +366,35 @@ const externalTrustAnchorAdapter = new EnvOrFileExternalTrustAnchorAdapter();
  */
 function startupIntegrityCheck(): void {
   ensureDataDirExists();
+  reconcileQuarantineIncidents();
+
   const ledgerExists = fs.existsSync(getAUDIT_LEDGER_FILE());
   const anchorExists = fs.existsSync(getTRUST_ANCHOR_FILE());
   const quarantineExists = fs.existsSync(getQUARANTINE_INCIDENT_FILE());
   const initMarkerExists = fs.existsSync(getSYSTEM_INIT_MARKER_FILE());
 
   let extInitialized = false;
+  let extSignatureInvalid = false;
+  let extError: string | undefined;
+
   if (externalTrustAnchorAdapter.isConfigured()) {
-    try {
-      if (process.env.TMPSP_EXTERNAL_REGISTRY_FILE && fs.existsSync(process.env.TMPSP_EXTERNAL_REGISTRY_FILE)) {
-        const content = fs.readFileSync(process.env.TMPSP_EXTERNAL_REGISTRY_FILE, 'utf8');
-        const parsed = JSON.parse(content);
-        if (parsed && parsed.systemId === 'TMPSP-MAIN' && parsed.status === 'INITIALIZED') {
-          extInitialized = true;
-        }
-      }
-    } catch {}
+    const extResult = externalTrustAnchorAdapter.verifyExternalInitializationSync('TMPSP-MAIN');
+    if (extResult.error?.includes('EXTERNAL_TRUST_ANCHOR_SIGNATURE_INVALID')) {
+      extSignatureInvalid = true;
+      extError = extResult.error;
+    } else if (extResult.isInitialized) {
+      extInitialized = true;
+    }
+  }
+
+  // HMAC Aláírás hamisításának észlelése a külső bizalmi horgonyban
+  if (extSignatureInvalid) {
+    serverIntegrityState = 'INTEGRITY_FAILURE';
+    lastIntegrityErrorCode = 'EXTERNAL_TRUST_ANCHOR_SIGNATURE_INVALID';
+    lastIntegrityError = extError || 'A külső horgony digitális aláírása érvénytelen!';
+    recordQuarantineIncident(lastIntegrityErrorCode, null, lastIntegrityError);
+    console.error(`CRITICAL ALARM: EXTERNAL TRUST ANCHOR FORGED! [${lastIntegrityErrorCode}]`);
+    return;
   }
 
   // AUD-001, AUD-004 & AUD-008: Ha az audit napló hiányzik, de a rendszer már inicializálva volt
@@ -726,7 +799,7 @@ function createForensicBundle(): { bundleDir: string; bundleName: string; manife
 }
 
 /**
- * Forenzikus archívum szigorú, fail-closed pre-recovery ellenőrzése (AUD-007 & AUD-007-FIX-01)
+ * Forenzikus archívum szigorú, fail-closed pre-recovery ellenőrzése (AUD-007, AUD-007-FIX-01 & Manifest Completeness)
  */
 function verifyForensicBundle(bundleDir: string, manifestPath: string): { isValid: boolean; error?: string } {
   if (!fs.existsSync(bundleDir)) {
@@ -745,6 +818,26 @@ function verifyForensicBundle(bundleDir: string, manifestPath: string): { isVali
 
   if (manifest.manifestVersion !== '1.0-forensic' || !Array.isArray(manifest.files)) {
     return { isValid: false, error: 'A manifest verziója vagy szerkezete érvénytelen.' };
+  }
+
+  // 1. Üres manifest elutasítása
+  if (manifest.files.length === 0) {
+    return { isValid: false, error: 'FORENSIC_MANIFEST_EMPTY: A manifest files tömbje üres. A hiányos bizonyítékcsomag miatt a recovery elutasítva.' };
+  }
+
+  // 2. Legalább egy alapvető integritási vagy incidens bizonyítékfájlnak szerepelnie kell
+  const coreEvidenceFiles = ['audit-ledger.jsonl', 'system-init.json', 'quarantine-incidents.jsonl', 'trust-anchor.json'];
+  const hasCoreEvidence = manifest.files.some((f) => coreEvidenceFiles.includes(f.relativePath) || f.relativePath.startsWith('quarantine-incident-'));
+  if (!hasCoreEvidence) {
+    return { isValid: false, error: 'FORENSIC_MANIFEST_INCOMPLETE: Semmilyen érvényes bizonyíték- vagy incidensfájl nem található a manifestben.' };
+  }
+
+  // 3. A bundle könyvtárban lévő fizikai fájlok és a manifest bejegyzéseinek 100%-os egyezőségének ellenőrzése (nincs nem listázott plusz fájl)
+  const actualPhysicalFiles = fs.readdirSync(bundleDir).filter((f) => f !== 'forensic-manifest.json');
+  for (const physicalFile of actualPhysicalFiles) {
+    if (!manifest.files.some((f) => f.relativePath === physicalFile)) {
+      return { isValid: false, error: `UNLISTED_FILE_IN_FORENSIC_BUNDLE: A bundle mappában olyan nem listázott fájl található, amely nem szerepel a manifestben: '${physicalFile}'.` };
+    }
   }
 
   const seenPaths = new Set<string>();
@@ -794,9 +887,9 @@ function verifyForensicBundle(bundleDir: string, manifestPath: string): { isVali
   return { isValid: true };
 }
 
-// API: Adminisztratív helyreállítási protokoll (AUD-001 & AUD-007 KÖVETELMÉNY)
+// API: Adminisztratív helyreállítási protokoll (AUD-001, AUD-007 & AUD-008 KÖVETELMÉNY)
 // Szigorúan védett timing-safe módon, SIKERTELEN KÍSÉRLET ALAPÚ IP RATE LIMIT-tel, KIZÁRÓLAG INTEGRITY_FAILURE MÓDBAN!
-app.post('/api/audit/recovery', (req, res) => {
+app.post('/api/audit/recovery', async (req, res) => {
   if (serverIntegrityState !== 'INTEGRITY_FAILURE') {
     return res.status(409).json({
       success: false,
@@ -856,6 +949,32 @@ app.post('/api/audit/recovery', (req, res) => {
 
     // 3. KIZÁRÓLAG sikeres archiválás és visszaellenőrzés után inicializálható az új tiszta napló!
     initializeFreshLedgerAndAnchor();
+
+    // 4. Külső bizalmi horgony frissítése és igazolása (AUD-008)
+    if (externalTrustAnchorAdapter.isConfigured()) {
+      const regRes = await externalTrustAnchorAdapter.registerExternalInitialization({
+        systemId: 'TMPSP-MAIN',
+        initializedAt: new Date().toISOString(),
+        environment: process.env.NODE_ENV || 'development',
+        status: 'INITIALIZED',
+        signature: '',
+      });
+
+      if (!regRes.success) {
+        serverIntegrityState = 'INTEGRITY_FAILURE';
+        lastIntegrityErrorCode = 'EXTERNAL_TRUST_ANCHOR_UPDATE_FAILED';
+        lastIntegrityError = regRes.error || 'A külső bizalmi horgony frissítése elutasítva.';
+        throw new Error(`EXTERNAL_TRUST_ANCHOR_UPDATE_FAILED: ${regRes.error}`);
+      }
+
+      const extVer = await externalTrustAnchorAdapter.verifyExternalInitialization('TMPSP-MAIN');
+      if (!extVer.isInitialized) {
+        serverIntegrityState = 'INTEGRITY_FAILURE';
+        lastIntegrityErrorCode = 'EXTERNAL_TRUST_ANCHOR_VERIFICATION_FAILED';
+        lastIntegrityError = extVer.error || 'A külső bizalmi horgony visszaellenőrzése sikertelen.';
+        throw new Error(`EXTERNAL_TRUST_ANCHOR_VERIFICATION_FAILED: ${extVer.error}`);
+      }
+    }
 
     res.json({
       success: true,
