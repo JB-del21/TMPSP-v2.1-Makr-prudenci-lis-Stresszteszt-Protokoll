@@ -9,4 +9,4 @@ coverage/
 
 # Futásidejű audit napló és bizalmi horgony: soha nem kerülhet verziókezelésbe
 # (az első indításkor az éles kulcsokkal jön létre)
-data/
+/data/
