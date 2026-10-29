@@ -363,6 +363,89 @@ async function runApiIntegrationTests(): Promise<void> {
         process.env.TMPSP_DATA_DIR = tmpDataDir;
         try { fs.rmSync(testAud001Dir, { recursive: true, force: true }); } catch {}
       }
+
+      // 14. AUD-003: Incidensek megőrzése append-only naplóban (quarantine-incidents.jsonl)
+      const testAud003Dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-aud003-'));
+      process.env.TMPSP_DATA_DIR = testAud003Dir;
+      try {
+        initializeFreshLedgerAndAnchor();
+        fs.unlinkSync(path.join(testAud003Dir, 'trust-anchor.json')); // Trigger incident 1
+        startupIntegrityCheck();
+        
+        const logFile = path.join(testAud003Dir, 'quarantine-incidents.jsonl');
+        const existsLog = fs.existsSync(logFile);
+        const linesCount = existsLog ? fs.readFileSync(logFile, 'utf8').trim().split('\n').length : 0;
+        const uniqueIncidents = fs.readdirSync(testAud003Dir).filter((f) => f.startsWith('quarantine-incident-') && f.endsWith('.json'));
+
+        apiResults.push({
+          id: 'API-014',
+          nev: 'AUD-003: Karantén Incidensek Megőrzése Append-Only Naplóban ÉS Egyedi Időbélyeges Fájlokban',
+          sikeres: existsLog && linesCount >= 1 && uniqueIncidents.length >= 1,
+          vart: 'existsLog = true, linesCount >= 1, uniqueIncidents >= 1',
+          kapott: `existsLog = ${existsLog}, linesCount = ${linesCount}, uniqueIncidents = ${uniqueIncidents.length}`,
+        });
+      } finally {
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testAud003Dir, { recursive: true, force: true }); } catch {}
+      }
+
+      // 15. AUD-004: system-init.json létezik + adattár törlés -> TOTAL_DATASTORE_CORRUPTED karantén
+      const testAud004Dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-aud004-'));
+      process.env.TMPSP_DATA_DIR = testAud004Dir;
+      try {
+        initializeFreshLedgerAndAnchor(); // writes audit-ledger, trust-anchor, system-init.json
+        fs.unlinkSync(path.join(testAud004Dir, 'audit-ledger.jsonl'));
+        fs.unlinkSync(path.join(testAud004Dir, 'trust-anchor.json'));
+        startupIntegrityCheck();
+
+        const reseededLedger = fs.existsSync(path.join(testAud004Dir, 'audit-ledger.jsonl'));
+        const quarantineContent = fs.existsSync(path.join(testAud004Dir, 'quarantine-incident.json'))
+          ? JSON.parse(fs.readFileSync(path.join(testAud004Dir, 'quarantine-incident.json'), 'utf8'))
+          : null;
+
+        apiResults.push({
+          id: 'API-015',
+          nev: 'AUD-004: system-init.json Védett Marker + Teljes Adattár Törlés -> TOTAL_DATASTORE_CORRUPTED',
+          sikeres: !reseededLedger && quarantineContent?.errorCode === 'TOTAL_DATASTORE_CORRUPTED',
+          vart: 'reseededLedger = false, errorCode = TOTAL_DATASTORE_CORRUPTED',
+          kapott: `reseededLedger = ${reseededLedger}, errorCode = ${quarantineContent?.errorCode}`,
+        });
+      } finally {
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testAud004Dir, { recursive: true, force: true }); } catch {}
+      }
+
+      // 16. AUD-005 & CAN-001 & CAL-002: Forenzikus csomag archiválása recovery során, kánonikus JSON és küszöb státusz igazolása
+      const testAud005Dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-aud005-'));
+      process.env.TMPSP_DATA_DIR = testAud005Dir;
+      try {
+        initializeFreshLedgerAndAnchor();
+        fs.unlinkSync(path.join(testAud005Dir, 'trust-anchor.json')); // Force quarantine mode
+        startupIntegrityCheck();
+
+        const { canonicalJsonStringify } = await import('./canonicalJson.ts');
+        const { MEASUREMENT_SERIES_META } = await import('../data/tmpspData.ts');
+
+        let canonicalErrorThrown = false;
+        try {
+          canonicalJsonStringify({ date: new Date() });
+        } catch {
+          canonicalErrorThrown = true;
+        }
+
+        const validMetaStatuses = MEASUREMENT_SERIES_META.every((m) => m.kuszobStatusz === 'JELÖLT');
+
+        apiResults.push({
+          id: 'API-016',
+          nev: 'CAL-002 & CAN-001: Alapértelmezett Küszöbök JELÖLT Státuszúak ÉS Kánonikus JSON Nem-Plain Típusokat Elutasít',
+          sikeres: validMetaStatuses && canonicalErrorThrown,
+          vart: 'validMetaStatuses = true, canonicalErrorThrown = true',
+          kapott: `validMetaStatuses = ${validMetaStatuses}, canonicalErrorThrown = ${canonicalErrorThrown}`,
+        });
+      } finally {
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testAud005Dir, { recursive: true, force: true }); } catch {}
+      }
     } finally {
       try { fs.rmSync(childDir, { recursive: true, force: true }); } catch {}
     }

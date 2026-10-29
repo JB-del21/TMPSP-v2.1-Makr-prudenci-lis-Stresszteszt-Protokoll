@@ -79,6 +79,8 @@ const getDATA_DIR = () => process.env.TMPSP_DATA_DIR ? path.resolve(process.env.
 const getAUDIT_LEDGER_FILE = () => path.resolve(getDATA_DIR(), 'audit-ledger.jsonl');
 const getTRUST_ANCHOR_FILE = () => path.resolve(getDATA_DIR(), 'trust-anchor.json');
 const getQUARANTINE_INCIDENT_FILE = () => path.resolve(getDATA_DIR(), 'quarantine-incident.json');
+const getQUARANTINE_INCIDENTS_LOG = () => path.resolve(getDATA_DIR(), 'quarantine-incidents.jsonl');
+const getSYSTEM_INIT_MARKER_FILE = () => path.resolve(getDATA_DIR(), 'system-init.json');
 
 function ensureDataDirExists(): void {
   const dir = getDATA_DIR();
@@ -107,19 +109,30 @@ function timingSafeCompare(a: string, b: string): boolean {
 }
 
 /**
- * Incidens naplózása a quarantine-incident.json fájlba
+ * Incidens naplózása a quarantine-incident.json, quarantine-incidents.jsonl és egyedi időbélyeges fájlba (AUD-003)
  */
 function recordQuarantineIncident(errorCode: string, brokenIndex: number | null, reason: string): void {
   ensureDataDirExists();
+  const incidentTimestamp = new Date().toISOString();
   const incidentData = {
-    incidentTimestamp: new Date().toISOString(),
+    incidentTimestamp,
     errorCode,
     brokenIndex,
     reason,
     ledgerPath: getAUDIT_LEDGER_FILE(),
     action: 'QUARANTINE_MODE_ACTIVE - Minden naplóírás zárolva, bizonyíték változatlanul megőrizve.',
   };
+  
+  // 1. Mindig frissítjük a legutóbbi incidens mutatóját
   fs.writeFileSync(getQUARANTINE_INCIDENT_FILE(), JSON.stringify(incidentData, null, 2), 'utf8');
+  
+  // 2. Append-only napló (quarantine-incidents.jsonl) az összes incidens megőrzésére
+  fs.appendFileSync(getQUARANTINE_INCIDENTS_LOG(), JSON.stringify(incidentData) + '\n', 'utf8');
+
+  // 3. Egyedi időbélyeges bizonyítékfájl mentése (quarantine-incident-<timestamp>.json)
+  const safeTs = incidentTimestamp.replace(/[:.]/g, '-');
+  const uniqueFile = path.resolve(getDATA_DIR(), `quarantine-incident-${safeTs}.json`);
+  fs.writeFileSync(uniqueFile, JSON.stringify(incidentData, null, 2), 'utf8');
 }
 
 /**
@@ -227,35 +240,54 @@ function initializeFreshLedgerAndAnchor(): void {
   };
   fs.writeFileSync(getTRUST_ANCHOR_FILE(), JSON.stringify(trustAnchor, null, 2), 'utf8');
 
+  // Kezdeti rendszer-inicializálási jelölőfájl elmentése (AUD-004)
+  const systemInitMarker = {
+    initializedAt: new Date().toISOString(),
+    initialSeedId: seed0Id,
+    systemVersion: 'TMPSP v2.1',
+    status: 'INITIALIZED',
+  };
+  fs.writeFileSync(getSYSTEM_INIT_MARKER_FILE(), JSON.stringify(systemInitMarker, null, 2), 'utf8');
+
   serverIntegrityState = 'OPERATIONAL';
   lastIntegrityError = null;
   lastIntegrityErrorCode = null;
 }
 
 /**
- * Rendszerindulási integritás-ellenőrzés (AUD-001 KÖVETELMÉNY)
- * Ha a fájl létezik, de sérült vagy hiányzik a bizalmi horgony, vagy ha a napló hiányzik de a horgony megvan,
- * a szerver SOHA NEM generál új seedet, hanem azonnal karanténba lép!
+ * Rendszerindulási integritás-ellenőrzés (AUD-001 & AUD-004 KÖVETELMÉNY)
+ * Ha az audit-ledger hiányzik, de a rendszer már inicializálva volt (system-init.json),
+ * vagy ha a bizalmi horgony / karantén megvan, a szerver TOTAL_DATASTORE_CORRUPTED vagy
+ * LEDGER_FILE_MISSING hibával karanténba lép és megtagadja az automatikus re-seedelést!
  */
 function startupIntegrityCheck(): void {
   ensureDataDirExists();
   const ledgerExists = fs.existsSync(getAUDIT_LEDGER_FILE());
   const anchorExists = fs.existsSync(getTRUST_ANCHOR_FILE());
   const quarantineExists = fs.existsSync(getQUARANTINE_INCIDENT_FILE());
+  const initMarkerExists = fs.existsSync(getSYSTEM_INIT_MARKER_FILE());
 
-  // AUD-001: Ha az audit napló hiányzik, de a bizalmi horgony vagy karantén feljegyzés létezik:
-  // AZONNAL KARANTÉN (LEDGER_FILE_MISSING)! Tilos az újragenerálás, mert az eltakarja a napló törlését/csonkítását.
-  if (!ledgerExists && (anchorExists || quarantineExists)) {
+  // AUD-001 & AUD-004: Ha az audit napló hiányzik, de a rendszer már inicializálva volt
+  // vagy a bizalmi horgony/karantén feljegyzés létezik: AZONNAL KARANTÉN!
+  if (!ledgerExists && (anchorExists || quarantineExists || initMarkerExists)) {
     serverIntegrityState = 'INTEGRITY_FAILURE';
-    lastIntegrityErrorCode = 'LEDGER_FILE_MISSING';
-    lastIntegrityError = 'Az audit-ledger.jsonl naplófájl hiányzik, miközben a bizalmi horgony (trust-anchor.json) létezik! Lehetséges naplótörlési vagy csonkítási támadás.';
-    recordQuarantineIncident('LEDGER_FILE_MISSING', null, lastIntegrityError);
-    console.error('CRITICAL ALARM: AUDIT LEDGER MISSING WHILE TRUST ANCHOR EXISTS!');
+    if (initMarkerExists && !anchorExists && !quarantineExists) {
+      lastIntegrityErrorCode = 'TOTAL_DATASTORE_CORRUPTED';
+      lastIntegrityError = 'A rendszer korábban már inicializálva volt (system-init.json létezik), de az audit napló és a bizalmi horgony hiányzik! Teljes adattár törlés vagy korrupció észlelve.';
+    } else if (!anchorExists) {
+      lastIntegrityErrorCode = 'TOTAL_DATASTORE_CORRUPTED';
+      lastIntegrityError = 'A meglévő adatállományok törlődtek vagy korrumpálódtak egy korábban inicializált rendszeren!';
+    } else {
+      lastIntegrityErrorCode = 'LEDGER_FILE_MISSING';
+      lastIntegrityError = 'Az audit-ledger.jsonl naplófájl hiányzik, miközben a bizalmi horgony (trust-anchor.json) létezik! Lehetséges naplótörlési vagy csonkítási támadás.';
+    }
+    recordQuarantineIncident(lastIntegrityErrorCode, null, lastIntegrityError);
+    console.error(`CRITICAL ALARM: AUDIT DATASTORE CORRUPTED! [${lastIntegrityErrorCode}]`);
     return;
   }
 
-  // Kizárólag szűz, még nem inicializált telepítés esetén hozható létre kezdeti seed
-  if (!ledgerExists && !anchorExists) {
+  // Kizárólag teljesen szűz, még sosem inicializált telepítés esetén hozható létre kezdeti seed
+  if (!ledgerExists && !anchorExists && !initMarkerExists) {
     initializeFreshLedgerAndAnchor();
     return;
   }
@@ -581,22 +613,62 @@ app.post('/api/audit/recovery', (req, res) => {
   failedRecoveryAttemptsMap.delete(clientIp);
 
   try {
-    // 1. A meglévő (esetleg sérült) fájl forenzikus archiválása időbélyeggel
+    // 1. Az ÖSSZES meglévő állapoti és incidens bizonyíték forenzikus csomagba gyűjtése (AUD-005)
     const archiveTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const archivePath = path.resolve(getDATA_DIR(), `archived-corrupted-ledger-${archiveTimestamp}.jsonl`);
+    const bundleName = `archived-forensic-bundle-${archiveTimestamp}`;
+    const bundleDir = path.resolve(getDATA_DIR(), bundleName);
+    fs.mkdirSync(bundleDir, { recursive: true });
 
-    if (fs.existsSync(getAUDIT_LEDGER_FILE())) {
-      fs.copyFileSync(getAUDIT_LEDGER_FILE(), archivePath);
-      console.log(`[TMPSP AUDIT RECOVERY] Korábbi napló archiválva forenzikus vizsgálatra: ${archivePath}`);
+    const filesToBundle = [
+      { name: 'audit-ledger.jsonl', path: getAUDIT_LEDGER_FILE() },
+      { name: 'trust-anchor.json', path: getTRUST_ANCHOR_FILE() },
+      { name: 'quarantine-incident.json', path: getQUARANTINE_INCIDENT_FILE() },
+      { name: 'quarantine-incidents.jsonl', path: getQUARANTINE_INCIDENTS_LOG() },
+      { name: 'system-init.json', path: getSYSTEM_INIT_MARKER_FILE() },
+    ];
+
+    const archivedFilesInfo: Array<{ filename: string; size: number; sha256: string }> = [];
+
+    for (const fileInfo of filesToBundle) {
+      if (fs.existsSync(fileInfo.path)) {
+        const destPath = path.resolve(bundleDir, fileInfo.name);
+        fs.copyFileSync(fileInfo.path, destPath);
+        const contentBuffer = fs.readFileSync(destPath);
+        const sha256 = crypto.createHash('sha256').update(contentBuffer).digest('hex');
+        archivedFilesInfo.push({
+          filename: fileInfo.name,
+          size: contentBuffer.length,
+          sha256,
+        });
+      }
     }
+
+    const manifestPath = path.resolve(bundleDir, 'forensic-manifest.json');
+    const manifestData = {
+      archivedAt: new Date().toISOString(),
+      recoveryTriggeredBy: 'ADMIN_RECOVERY_PROTOCOL',
+      previousIntegrityState: serverIntegrityState,
+      lastIntegrityErrorCode,
+      lastIntegrityError,
+      archivedFilesCount: archivedFilesInfo.length,
+      files: archivedFilesInfo,
+    };
+    fs.writeFileSync(manifestPath, JSON.stringify(manifestData, null, 2), 'utf8');
+
+    if (!fs.existsSync(bundleDir) || !fs.existsSync(manifestPath)) {
+      throw new Error('FORENSIC_BUNDLE_FAILED: A forenzikus archiválási csomag nem hozható létre.');
+    }
+
+    console.log(`[TMPSP AUDIT RECOVERY] Teljes állapoti bizonyíték archiválva forenzikus csomagba: ${bundleDir}`);
 
     // 2. Új tiszta állapot és bizalmi horgony felépítése
     initializeFreshLedgerAndAnchor();
 
     res.json({
       success: true,
-      message: 'Audit napló helyreállítása sikeres. A sérült állomány változatlanul archiválásra került.',
-      archivedFile: path.basename(archivePath),
+      message: 'Audit napló helyreállítása sikeres. A teljes forenzikus bizonyítékcsomag archiválásra került.',
+      archivedBundleDir: bundleName,
+      manifestFile: 'forensic-manifest.json',
       serverIntegrityState: 'OPERATIONAL',
     });
   } catch (error: any) {
@@ -625,7 +697,17 @@ async function startServer() {
   });
 }
 
-export { app, startupIntegrityCheck, initializeFreshLedgerAndAnchor, readAuditLedger, readTrustAnchor, getDATA_DIR };
+export {
+  app,
+  startupIntegrityCheck,
+  initializeFreshLedgerAndAnchor,
+  readAuditLedger,
+  readTrustAnchor,
+  getDATA_DIR,
+  getQUARANTINE_INCIDENTS_LOG,
+  getSYSTEM_INIT_MARKER_FILE,
+  getQUARANTINE_INCIDENT_FILE,
+};
 
 const isMainModule = process.argv[1] && (process.argv[1].endsWith('server.ts') || process.argv[1].endsWith('server.js'));
 if (isMainModule && process.env.NODE_ENV !== 'test') {
