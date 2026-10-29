@@ -196,10 +196,10 @@ export function runThresholdBacktest(
     indoklas = 'Zéró variancia: az indikátor értékei konstansok a mintában, nincs diszkriminációs erő (AUC = 0.50).';
     gazdasagiStatusz = 'JELÖLT';
   } else if (boundedAuc >= 0.75 && fpr <= 15) {
-    indoklas = `Magas diszkriminációs erő (AUC: ${boundedAuc.toFixed(2)}), alacsony téves riasztási arány (${fpr.toFixed(1)}%). A küszöb statisztikailag validálható.`;
-    gazdasagiStatusz = 'STATISZTIKAILAG_VALIDÁLT';
+    indoklas = `Magas kis mintás teszt AUC (AUC: ${boundedAuc.toFixed(2)}), alacsony FPR (${fpr.toFixed(1)}%). Korlátozott bázisidőszak (8 negyedév, 2 stresszesemény) miatt a küszöb JELÖLT státuszban marad az éles felügyeleti validációig.`;
+    gazdasagiStatusz = meta.kuszobStatusz === 'STATISZTIKAILAG_VALIDÁLT' ? 'STATISZTIKAILAG_VALIDÁLT' : 'JELÖLT';
   } else if (boundedAuc < 0.75) {
-    indoklas = `Mérsékelt vagy alacsony AUC (${boundedAuc.toFixed(2)} < 0.75). A jelölt küszöb még nem validálható, jelölt státuszban marad.`;
+    indoklas = `Mérsékelt vagy alacsony AUC (${boundedAuc.toFixed(2)} < 0.75). A jelolt küszöb még nem validálható, jelölt státuszban marad.`;
     gazdasagiStatusz = 'JELÖLT';
   } else {
     indoklas = `Magas téves riasztási ráta (${fpr.toFixed(1)}% > 15%). További szűrés vagy perzisztencia-feltétel szükséges.`;
@@ -235,10 +235,9 @@ export function generateThresholdCalibrationRegister(
     let finalStatus = meta.kuszobStatusz;
     if (backtest.isDegenerate || backtest.auc === null) {
       finalStatus = 'NEM_KALIBRÁLHATÓ';
-    } else if (meta.alapertelmezettDRL !== 'HOZZÁFÉRÉS_KÉRDÉSES' && meta.alapertelmezettDRL !== 'NEM_ELÉRHETŐ') {
-      finalStatus = backtest.gazdasagiStatusz;
     } else {
-      finalStatus = 'JELÖLT';
+      // CAL-001: Kis mintán visszatesztelt JELÖLT küszöbök nem léptethetők elő automatikusan STATISZTIKAILAG_VALIDÁLT-ra
+      finalStatus = meta.kuszobStatusz;
     }
 
     return {

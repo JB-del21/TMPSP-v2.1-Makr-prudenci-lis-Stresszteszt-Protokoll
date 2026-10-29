@@ -147,6 +147,30 @@ export function canonicalJsonStringify(value: unknown): string {
   }
 
   if (typeof value === 'object') {
+    // Szigorú nem-JSON objektum-típusok szűrése (CAN-001)
+    if (
+      value instanceof Date ||
+      value instanceof Map ||
+      value instanceof Set ||
+      value instanceof RegExp ||
+      value instanceof Error
+    ) {
+      throw new CanonicalJsonError(
+        `A(z) '${value.constructor?.name}' nem érvényes JSON objektum típus. RFC 8785 csak egyszerű JSON objektumokat engedélyez.`
+      );
+    }
+
+    if (Object.getOwnPropertySymbols(value).length > 0) {
+      throw new CanonicalJsonError('Szimbólum kulcsos tulajdonságok nem engedélyezettek az RFC 8785 kánonikus JSON-ben.');
+    }
+
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== null && proto !== Object.prototype) {
+      throw new CanonicalJsonError(
+        `Nem egyszerű JSON objektum (prototípus: ${proto?.constructor?.name ?? 'egyedi'}). Csak nyers JSON objektumok szerializálhatók.`
+      );
+    }
+
     const obj = value as Record<string, unknown>;
 
     // Kulcsok kinyerése és szigorú UTF-16 kódrendezése (RFC 8785 Section 3.2.3)

@@ -342,6 +342,27 @@ async function runApiIntegrationTests(): Promise<void> {
         vart: 'exit 1',
         kapott: `exit ${c12.status}`,
       });
+
+      // 13. AUD-001: Napló törlése létező horgony mellett -> LEDGER_FILE_MISSING karantén
+      const testAud001Dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-aud001-'));
+      process.env.TMPSP_DATA_DIR = testAud001Dir;
+      try {
+        initializeFreshLedgerAndAnchor(); // Let's create both files
+        fs.unlinkSync(path.join(testAud001Dir, 'audit-ledger.jsonl')); // Delete only ledger
+        startupIntegrityCheck();
+        const ledgerRecreated = fs.existsSync(path.join(testAud001Dir, 'audit-ledger.jsonl'));
+        const quarantineCreated = fs.existsSync(path.join(testAud001Dir, 'quarantine-incident.json'));
+        apiResults.push({
+          id: 'API-013',
+          nev: 'AUD-001: Hiányzó Napló Létező Horgonnyal -> Karantén (LEDGER_FILE_MISSING), Újragenerálás Tiltva',
+          sikeres: !ledgerRecreated && quarantineCreated,
+          vart: 'ledgerRecreated = false, quarantineCreated = true',
+          kapott: `ledgerRecreated = ${ledgerRecreated}, quarantineCreated = ${quarantineCreated}`,
+        });
+      } finally {
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testAud001Dir, { recursive: true, force: true }); } catch {}
+      }
     } finally {
       try { fs.rmSync(childDir, { recursive: true, force: true }); } catch {}
     }

@@ -159,17 +159,17 @@ function readTrustAnchor(): TrustAnchor | null {
  */
 function initializeFreshLedgerAndAnchor(): void {
   ensureDataDirExists();
-  console.log('[TMPSP AUDIT] Új audit napló és bizalmi horgony inicializálása...');
+  console.log('[TMPSP AUDIT] Új audit napló és bizalmi horgony inicializálása (DEMO_FIXTURE / SZINTETIKUS_SEED)...');
 
   const seed0Id = 'AUD-2024Q1-001';
   const seed0Payload = {
     negyedev: '2024Q1',
-    esemenyTipus: 'SZINTETIKUS_PILOT',
-    kepletVerzio: 'v2.1-baseline',
-    elozetesHipotezis: 'A 2024 eleji lakáspiaci élénkülés ellenére a középkategóriás DOM nő, és az 550–800k jövedelmi sáv hozzáférési rátája 45% alá esik.',
-    nullhipotezis: 'A hozzáférési ráta elmozdulása szezonális ingadozás; a DOM növekedése a prémium szegmens gyorsulásának műterméke.',
+    esemenyTipus: 'SZINTETIKUS_SEED',
+    kepletVerzio: 'v2.1-synthetic-seed',
+    elozetesHipotezis: 'DEMO_FIXTURE / SZINTETIKUS_SEED: A 2024 eleji lakáspiaci élénkülés ellenére a középkategóriás DOM nő, és az 550–800k jövedelmi sáv hozzáférési rátája 45% alá esik.',
+    nullhipotezis: 'DEMO_FIXTURE / SZINTETIKUS_SEED: Szezonális ingadozás feltételezése.',
     mertEltérés: '1.2a: 42,04% (<45%); 1.3: 53,26% (>50%); 2.1: 2,088 (>2,0); 2.4: ADATHIÁNY.',
-    döntésiEredmény: 'SÁRGA - ELŐZETES (Konzervatív besorolás: nincs hamis Piros, adatminőségi és perzisztencia-szűrők aktívak).',
+    döntésiEredmény: 'DEMO_FIXTURE / SZINTETIKUS_SEED: SÁRGA - ELŐZETES (Kezdeti szimulált beállítás, nem minősül hivatalos jegybanki hitelesítésnek).',
     felelős: 'MNB Makroprudenciális Főosztály',
     bemenetiHash: crypto.createHash('sha256').update(JSON.stringify({ dataset: '2024Q1_synthetic_pilot_v2.1' })).digest('hex'),
   };
@@ -190,12 +190,12 @@ function initializeFreshLedgerAndAnchor(): void {
   const seed1Id = 'AUD-2024Q4-002';
   const seed1Payload = {
     negyedev: '2024Q4',
-    esemenyTipus: 'KÜSZÖB_MÓDOSÍTÁS',
-    kepletVerzio: 'v2.1-calibrated',
-    elozetesHipotezis: 'A 2023Q1–2024Q4 bázisidőszakon végzett visszatesztelés alapján a validált küszöbök AUC értéke meghaladja a 0.75-öt.',
-    nullhipotezis: 'A jelölt küszöbök diszkriminációs képessége nem jobb a véletlen besorolásnál (AUC <= 0.50).',
-    mertEltérés: '1.2b, 1.4, 2.3, 3.2, 3.3, 4.1 mutatóknál az AUC >= 0.75 és FPR <= 15% teljesült.',
-    döntésiEredmény: '6 indikátor küszöb státusza STATISZTIKAILAG_VALIDÁLT-ra frissült; 9 indikátor maradt JELÖLT státuszban.',
+    esemenyTipus: 'SZINTETIKUS_SEED',
+    kepletVerzio: 'v2.1-synthetic-seed',
+    elozetesHipotezis: 'DEMO_FIXTURE / SZINTETIKUS_SEED: Kezdeti szimulált bázisidőszaki visszatesztelés.',
+    nullhipotezis: 'DEMO_FIXTURE / SZINTETIKUS_SEED: Véletlen diszkrimináció nullhipotézise.',
+    mertEltérés: '1.2b, 1.4, 2.3, 3.2, 3.3, 4.1 mutatók tesztértéke.',
+    döntésiEredmény: 'DEMO_FIXTURE / SZINTETIKUS_SEED: Indikátorküszöbök szimulált állapota (DEMO FIXTURE).',
     felelős: 'Kockázatelemzési Munkacsoport',
     bemenetiHash: crypto.createHash('sha256').update(JSON.stringify({ backtest_period: '2023Q1-2024Q4' })).digest('hex'),
   };
@@ -223,7 +223,7 @@ function initializeFreshLedgerAndAnchor(): void {
     checkpointHash: seed1Hash,
     checkpointTimestamp: seed1Timestamp,
     authoritativeDigest,
-    description: 'Hitelesített jegybanki ellenőrzőpont a 2024Q4 kalibrációs záráshoz (HMAC védett).',
+    description: 'DEMO_FIXTURE / SZINTETIKUS_SEED: Kezdeti szimulált bizalmi horgony tesztkörnyezethez (HMAC védett).',
   };
   fs.writeFileSync(getTRUST_ANCHOR_FILE(), JSON.stringify(trustAnchor, null, 2), 'utf8');
 
@@ -234,11 +234,28 @@ function initializeFreshLedgerAndAnchor(): void {
 
 /**
  * Rendszerindulási integritás-ellenőrzés (AUD-001 KÖVETELMÉNY)
- * Ha a fájl létezik, de sérült vagy hiányzik a bizalmi horgony, a szerver SOHA NEM generál újat, hanem azonnal karanténba lép!
+ * Ha a fájl létezik, de sérült vagy hiányzik a bizalmi horgony, vagy ha a napló hiányzik de a horgony megvan,
+ * a szerver SOHA NEM generál új seedet, hanem azonnal karanténba lép!
  */
 function startupIntegrityCheck(): void {
   ensureDataDirExists();
-  if (!fs.existsSync(getAUDIT_LEDGER_FILE())) {
+  const ledgerExists = fs.existsSync(getAUDIT_LEDGER_FILE());
+  const anchorExists = fs.existsSync(getTRUST_ANCHOR_FILE());
+  const quarantineExists = fs.existsSync(getQUARANTINE_INCIDENT_FILE());
+
+  // AUD-001: Ha az audit napló hiányzik, de a bizalmi horgony vagy karantén feljegyzés létezik:
+  // AZONNAL KARANTÉN (LEDGER_FILE_MISSING)! Tilos az újragenerálás, mert az eltakarja a napló törlését/csonkítását.
+  if (!ledgerExists && (anchorExists || quarantineExists)) {
+    serverIntegrityState = 'INTEGRITY_FAILURE';
+    lastIntegrityErrorCode = 'LEDGER_FILE_MISSING';
+    lastIntegrityError = 'Az audit-ledger.jsonl naplófájl hiányzik, miközben a bizalmi horgony (trust-anchor.json) létezik! Lehetséges naplótörlési vagy csonkítási támadás.';
+    recordQuarantineIncident('LEDGER_FILE_MISSING', null, lastIntegrityError);
+    console.error('CRITICAL ALARM: AUDIT LEDGER MISSING WHILE TRUST ANCHOR EXISTS!');
+    return;
+  }
+
+  // Kizárólag szűz, még nem inicializált telepítés esetén hozható létre kezdeti seed
+  if (!ledgerExists && !anchorExists) {
     initializeFreshLedgerAndAnchor();
     return;
   }

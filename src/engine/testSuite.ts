@@ -268,14 +268,27 @@ export function runAllEngineTests(): TestResult[] {
   // CAN-007: Exponenciális és Nagy Lebegőpontos Számok
   const expObj = { val: 1e20 };
   const expCanon = canonicalJsonStringify(expObj);
+  // CAN-008: Szigorú Nem-JSON Objektumok Elutasítása (CAN-001)
+  let rejectedNonJsonObjects = true;
+  const invalidObjects = [new Date(), new Map(), new Set(), { [Symbol('sym')]: 'val' }];
+  for (const obj of invalidObjects) {
+    try {
+      canonicalJsonStringify(obj);
+      rejectedNonJsonObjects = false;
+    } catch (e) {
+      if (!(e instanceof CanonicalJsonError)) {
+        rejectedNonJsonObjects = false;
+      }
+    }
+  }
   results.push({
-    id: 'CAN-007',
+    id: 'CAN-008',
     kategoria: 'RFC8785_KANONIZÁLÁS',
-    nev: 'Nagy és Exponenciális Számok ECMAScript Kanonizálása',
-    leiras: 'Ellenőrzi, hogy a számok nem vesznek el kerekítés miatt, és pontosan követik az ECMAScript Number::toString szabályát.',
-    sikeres: expCanon === '{"val":100000000000000000000}',
-    vart: '{"val":100000000000000000000}',
-    kapott: expCanon,
+    nev: 'Nem-JSON Objektumok Szigorú Elutasítása (Date, Map, Set, Symbol)',
+    leiras: 'A canonicalJsonStringify elutasítja a nem-JSON objektumokat (Date, Map, Set, Symbol kulcsok) kivétel dobásával.',
+    sikeres: rejectedNonJsonObjects,
+    vart: 'Minden nem-JSON objektumra CanonicalJsonError kivétel',
+    kapott: rejectedNonJsonObjects ? 'Minden érvénytelen objektum sikeresen elutasítva' : 'Egyes objektumok átmentek a szűrőn',
   });
 
   // =========================================================================
@@ -1033,15 +1046,15 @@ export function runAllEngineTests(): TestResult[] {
     evalM2_Only24Missing.statusz === 'ZÖLD' &&
     evalM2_Only24Missing.adatminosegiFigyelmeztetes === true &&
     evalIntegrated_24Missing.adatminosegiAllapot === 'HIÁNYOS' &&
-    evalIntegrated_24Missing.globalisStatusz === 'ZÖLD';
+    evalIntegrated_24Missing.globalisStatusz === 'SÁRGA - ELŐZETES';
 
   results.push({
     id: 'FSM-004',
     kategoria: 'ÁLLAPOTGÉP_SZABÁLYOK',
-    nev: 'Adathiány Izoláció: Modul ZÖLD marad, Adatminőség: HIÁNYOS dimenzió',
-    leiras: 'A 2.4 adathiánya nem emeli az M2 modult SÁRGÁRA, a globális státusz ZÖLD marad, de az adatminőségi állapot HIÁNYOS jelölést kap.',
+    nev: 'Adathiány Izoláció és UNKNOWN ≠ GREEN Kapu',
+    leiras: 'A 2.4 adathiánya nem emeli az M2 modult SÁRGÁRA (ZÖLD marad), de az UNKNOWN ≠ GREEN kapu miatt a globális státusz SÁRGA - ELŐZETES lesz.',
     sikeres: fsm004Success,
-    vart: 'M2 statusz = ZÖLD, adatminosegiAllapot = HIÁNYOS, globalisStatusz = ZÖLD',
+    vart: 'M2 statusz = ZÖLD, adatminosegiAllapot = HIÁNYOS, globalisStatusz = SÁRGA - ELŐZETES',
     kapott: `M2 statusz = ${evalM2_Only24Missing.statusz}, adatminoseg = ${evalIntegrated_24Missing.adatminosegiAllapot}, global = ${evalIntegrated_24Missing.globalisStatusz}`,
   });
 

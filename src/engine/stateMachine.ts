@@ -430,6 +430,11 @@ export function evaluateIntegratedStateMachine(
       globalisStatusz = 'SÁRGA - ELŐZETES';
       szukKeresztmetszet = 'Hitelhozzáférési szűkülés vagy likviditási lassulás feltételezhető.';
       prioritasosAkcio = 'Adategyeztetés és okfeltárás az adatgazdákkal. Politikai beavatkozás NEM indokolt, amíg a perzisztencia nincs igazolva.';
+    } else if (adatminosegiAllapot === 'HIÁNYOS') {
+      // FSM-001: UNKNOWN ≠ GREEN kapu. Kritikus adathiány esetén a globális állapot nem lehet ZÖLD.
+      globalisStatusz = 'SÁRGA - ELŐZETES';
+      szukKeresztmetszet = 'Adatminőségi blokkolás: kritikus adathiány vagy DRL hozzáférési korlát miatt a rendszer állapota nem értékelhető ZÖLD-ként (UNKNOWN ≠ GREEN).';
+      prioritasosAkcio = 'Sürgős adategyeztetés és adatszolgáltatási ellenőrzés az érintett adatgazdákkal az adathiány pótlásáig.';
     } else {
       globalisStatusz = 'ZÖLD';
     }
