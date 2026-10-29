@@ -95,6 +95,7 @@ async function runApiIntegrationTests(): Promise<void> {
     app,
     startupIntegrityCheck,
     initializeFreshLedgerAndAnchor,
+    parseTrustProxy,
   } = await import('../../server.ts');
 
   console.log('================================================================');
@@ -116,6 +117,31 @@ async function runApiIntegrationTests(): Promise<void> {
   const apiResults: ApiTestResult[] = [];
 
   try {
+    // 0. UNIT-001: parseTrustProxy értelmezése (a parseInt-es hiba ellen: "127.0.0.1" nem lehet 127 ugrás)
+    const trustCases: Array<[string | undefined, unknown]> = [
+      ['1', 1], ['2', 2], ['loopback', 'loopback'], ['127.0.0.1', '127.0.0.1'],
+      ['10.0.0.0/8', '10.0.0.0/8'], ['10.0.0.1, 10.0.0.2', '10.0.0.1, 10.0.0.2'],
+      ['', false], [undefined, false], ['false', false],
+    ];
+    const trustFailures: string[] = [];
+    for (const [input, expected] of trustCases) {
+      let got: unknown;
+      try { got = parseTrustProxy(input); } catch (e: any) { got = `EXCEPTION(${e.message})`; }
+      if (got !== expected) trustFailures.push(`${JSON.stringify(input)} -> ${JSON.stringify(got)} (várt: ${JSON.stringify(expected)})`);
+    }
+    for (const forbidden of ['true', 'TRUE', 'all', '*']) {
+      let threw = false;
+      try { parseTrustProxy(forbidden); } catch { threw = true; }
+      if (!threw) trustFailures.push(`${JSON.stringify(forbidden)} nem dobott kivételt`);
+    }
+    apiResults.push({
+      id: 'UNIT-001',
+      nev: 'parseTrustProxy: Számjegy = Ugrásszám, IP/CIDR Változatlan, true/all Tiltott',
+      sikeres: trustFailures.length === 0,
+      vart: 'minden eset a specifikáció szerint',
+      kapott: trustFailures.length === 0 ? `${trustCases.length + 4} eset rendben` : trustFailures.join('; '),
+    });
+
     // 1. API-001: 401 Unauthorized hitelesítés nélküli írásnál
     const resAuthMissing = await makeRequest('POST', '/api/audit', {}, { negyedev: '2024Q1', esemenyTipus: 'PILOT', kepletVerzio: 'v2.1', felelős: 'MNB' });
     apiResults.push({
