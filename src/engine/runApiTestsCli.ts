@@ -415,37 +415,238 @@ async function runApiIntegrationTests(): Promise<void> {
         try { fs.rmSync(testAud004Dir, { recursive: true, force: true }); } catch {}
       }
 
-      // 16. AUD-005 & CAN-001 & CAL-002: Forenzikus csomag archiválása recovery során, kánonikus JSON és küszöb státusz igazolása
-      const testAud005Dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-aud005-'));
-      process.env.TMPSP_DATA_DIR = testAud005Dir;
-      try {
-        initializeFreshLedgerAndAnchor();
-        fs.unlinkSync(path.join(testAud005Dir, 'trust-anchor.json')); // Force quarantine mode
-        startupIntegrityCheck();
+      // 16. CI-002-CFG: Alapértelmezett küszöbök JELÖLT státusza
+      const { MEASUREMENT_SERIES_META } = await import('../data/tmpspData.ts');
+      const allMetaJelolt = MEASUREMENT_SERIES_META.every((m) => m.kuszobStatusz === 'JELÖLT');
+      apiResults.push({
+        id: 'CI-002-CFG',
+        nev: 'CAL-002: Alapértelmezett Küszöbök KIZÁRÓLAG JELÖLT Státuszúak',
+        sikeres: allMetaJelolt,
+        vart: 'minden kuszobStatusz === JELÖLT',
+        kapott: allMetaJelolt ? 'Minden küszöb JELÖLT státuszú' : 'Található nem JELÖLT küszöb',
+      });
 
-        const { canonicalJsonStringify } = await import('./canonicalJson.ts');
-        const { MEASUREMENT_SERIES_META } = await import('../data/tmpspData.ts');
-
-        let canonicalErrorThrown = false;
+      // 17. CI-002-CAN: Nem támogatott JSON-típusok szigorú elutasítása (CAN-001)
+      const { canonicalJsonStringify } = await import('./canonicalJson.ts');
+      let canonicalTypesRejected = true;
+      const invalidTypes = [new Date(), new Map(), new Set(), /abc/, new Error('err')];
+      for (const item of invalidTypes) {
         try {
-          canonicalJsonStringify({ date: new Date() });
-        } catch {
-          canonicalErrorThrown = true;
+          canonicalJsonStringify(item);
+          canonicalTypesRejected = false;
+        } catch {}
+      }
+      apiResults.push({
+        id: 'CI-002-CAN',
+        nev: 'CAN-001: Nem-Plain JSON Típusok (Date, Map, Set, RegExp, Error) Szigorú Elutasítása',
+        sikeres: canonicalTypesRejected,
+        vart: 'Minden nem-plain JSON típus kivételt dob',
+        kapott: canonicalTypesRejected ? 'Minden érvénytelen típus elutasítva' : 'A kanonizáló átengedett érvénytelen típust',
+      });
+
+      // 18. CI-002-INC: Incidensnapló append-only és egyedi atomic 'wx' fájllétrehozás
+      const { recordQuarantineIncident, createForensicBundle, verifyForensicBundle } = await import('../../server.ts');
+      const testIncDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-inc-'));
+      process.env.TMPSP_DATA_DIR = testIncDir;
+      try {
+        const id1 = recordQuarantineIncident('TEST_ERR_1', 0, 'Reason 1');
+        const id2 = recordQuarantineIncident('TEST_ERR_2', 1, 'Reason 2');
+
+        const file1 = path.join(testIncDir, `quarantine-incident-${id1}.json`);
+        const file2 = path.join(testIncDir, `quarantine-incident-${id2}.json`);
+        const exists1 = fs.existsSync(file1);
+        const exists2 = fs.existsSync(file2);
+
+        // Ellenőrizzük, hogy az atomic 'wx' próbálkozás létező fájl esetén elbukik-e (EEXIST)
+        let openWxFailed = false;
+        try {
+          fs.openSync(file1, 'wx');
+        } catch (e: any) {
+          if (e.code === 'EEXIST') openWxFailed = true;
         }
 
-        const validMetaStatuses = MEASUREMENT_SERIES_META.every((m) => m.kuszobStatusz === 'JELÖLT');
-
         apiResults.push({
-          id: 'API-016',
-          nev: 'CAL-002 & CAN-001: Alapértelmezett Küszöbök JELÖLT Státuszúak ÉS Kánonikus JSON Nem-Plain Típusokat Elutasít',
-          sikeres: validMetaStatuses && canonicalErrorThrown,
-          vart: 'validMetaStatuses = true, canonicalErrorThrown = true',
-          kapott: `validMetaStatuses = ${validMetaStatuses}, canonicalErrorThrown = ${canonicalErrorThrown}`,
+          id: 'CI-002-INC',
+          nev: 'AUD-006: Incidensfájlok Atomic Kizárólagos Létrehozása (fs.openSync wx) és Egyedi AZONOSÍTÓK',
+          sikeres: exists1 && exists2 && id1 !== id2 && openWxFailed,
+          vart: 'exists1 = true, exists2 = true, id1 !== id2, openWx EEXIST = true',
+          kapott: `exists1 = ${exists1}, exists2 = ${exists2}, id1 != id2: ${id1 !== id2}, openWxFailed = ${openWxFailed}`,
         });
       } finally {
         process.env.TMPSP_DATA_DIR = tmpDataDir;
-        try { fs.rmSync(testAud005Dir, { recursive: true, force: true }); } catch {}
+        try { fs.rmSync(testIncDir, { recursive: true, force: true }); } catch {}
       }
+
+      // 19. CI-002-CNC: Konkurens/párhuzamos incidensrögzítés
+      const testCncDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-cnc-'));
+      process.env.TMPSP_DATA_DIR = testCncDir;
+      try {
+        const promises = Array.from({ length: 10 }).map((_, i) =>
+          Promise.resolve().then(() => recordQuarantineIncident('CONCURRENT_ERR', i, `Parallel test ${i}`))
+        );
+        const ids = await Promise.all(promises);
+        const uniqueIds = new Set(ids);
+        const files = fs.readdirSync(testCncDir).filter((f) => f.startsWith('quarantine-incident-INC-'));
+
+        apiResults.push({
+          id: 'CI-002-CNC',
+          nev: 'AUD-006: Párhuzamos Incidensrögzítés Ütközésmentessége és Bizonyíték-megőrzése',
+          sikeres: ids.length === 10 && uniqueIds.size === 10 && files.length === 10,
+          vart: '10/10 egyedi incidensfájl és azonosító',
+          kapott: `Generált: ${ids.length}, Egyedi ID-k: ${uniqueIds.size}, Fájlok: ${files.length}`,
+        });
+      } finally {
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testCncDir, { recursive: true, force: true }); } catch {}
+      }
+
+      // 20. CI-002-BND: Teljes forenzikus csomag archiválása (tartalmazza az összes incidensfájlt)
+      const testBndDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-bnd-'));
+      process.env.TMPSP_DATA_DIR = testBndDir;
+      try {
+        initializeFreshLedgerAndAnchor();
+        const id1 = recordQuarantineIncident('ERR_A', 0, 'Reason A');
+        const id2 = recordQuarantineIncident('ERR_B', 1, 'Reason B');
+
+        const bundleRes = createForensicBundle();
+        const archivedFiles = fs.readdirSync(bundleRes.bundleDir);
+
+        const hasLedger = archivedFiles.includes('audit-ledger.jsonl');
+        const hasAnchor = archivedFiles.includes('trust-anchor.json');
+        const hasInit = archivedFiles.includes('system-init.json');
+        const hasInc1 = archivedFiles.includes(`quarantine-incident-${id1}.json`);
+        const hasInc2 = archivedFiles.includes(`quarantine-incident-${id2}.json`);
+        const hasManifest = archivedFiles.includes('forensic-manifest.json');
+
+        apiResults.push({
+          id: 'CI-002-BND',
+          nev: 'AUD-007: Teljes Forenzikus Archívum (Minden Incidens- és Állapotfájl Bekerül)',
+          sikeres: hasLedger && hasAnchor && hasInit && hasInc1 && hasInc2 && hasManifest,
+          vart: 'Minden bizonyítékfájl és a manifest bent van a csomagban',
+          kapott: `ledger: ${hasLedger}, anchor: ${hasAnchor}, init: ${hasInit}, inc1: ${hasInc1}, inc2: ${hasInc2}, manifest: ${hasManifest}`,
+        });
+      } finally {
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testBndDir, { recursive: true, force: true }); } catch {}
+      }
+
+      // 21. CI-002-MAN: Manifest SHA-256 byte hash és méretellenőrzés
+      const testManDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-man-'));
+      process.env.TMPSP_DATA_DIR = testManDir;
+      try {
+        initializeFreshLedgerAndAnchor();
+        recordQuarantineIncident('ERR_MAN', 0, 'Manifest verify');
+
+        const bundleRes = createForensicBundle();
+        const verifyRes = verifyForensicBundle(bundleRes.bundleDir, bundleRes.manifestPath);
+
+        apiResults.push({
+          id: 'CI-002-MAN',
+          nev: 'AUD-007: Forenzikus Manifest SHA-256 Hash és Méret Ellenőrzés',
+          sikeres: verifyRes.isValid,
+          vart: 'isValid = true',
+          kapott: `isValid = ${verifyRes.isValid}, err = ${verifyRes.error || 'none'}`,
+        });
+      } finally {
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testManDir, { recursive: true, force: true }); } catch {}
+      }
+
+      // 22. CI-002-TMP: Módosított archív fájl elutasítása (SHA-256 Hash Mismatch -> Recovery Abort)
+      const testTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-tmp-'));
+      process.env.TMPSP_DATA_DIR = testTmpDir;
+      try {
+        initializeFreshLedgerAndAnchor();
+        recordQuarantineIncident('ERR_TMP', 0, 'Tamper verify');
+
+        const bundleRes = createForensicBundle();
+        // Szándékos in-place byte hamisítás a fájlméret megtartásával (SHA-256 teszthez)
+        const ledgerInBundle = path.join(bundleRes.bundleDir, 'audit-ledger.jsonl');
+        const rawBuf = fs.readFileSync(ledgerInBundle);
+        rawBuf[0] = rawBuf[0] === 123 ? 125 : 123;
+        fs.writeFileSync(ledgerInBundle, rawBuf);
+
+        const verifyTampered = verifyForensicBundle(bundleRes.bundleDir, bundleRes.manifestPath);
+
+        apiResults.push({
+          id: 'CI-002-TMP',
+          nev: 'AUD-007: Manipulált Archívum Elutasítása (SHA-256 Hash Mismatch -> Recovery Abort)',
+          sikeres: !verifyTampered.isValid && Boolean(verifyTampered.error?.includes('SHA-256 hash eltérés')),
+          vart: 'isValid = false, SHA-256 hash eltérés detektálva',
+          kapott: `isValid = ${verifyTampered.isValid}, error = ${verifyTampered.error}`,
+        });
+      } finally {
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testTmpDir, { recursive: true, force: true }); } catch {}
+      }
+
+      // 23. CI-002-IMM: Sikertelen recovery esetén az eredeti bizonyítékok és ledger sértetlenek maradnak
+      app.set('trust proxy', 1);
+      const testImmDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-imm-'));
+      process.env.TMPSP_DATA_DIR = testImmDir;
+      try {
+        initializeFreshLedgerAndAnchor();
+        fs.unlinkSync(path.join(testImmDir, 'trust-anchor.json')); // Enter quarantine
+        startupIntegrityCheck();
+
+        const origLedgerContent = fs.readFileSync(path.join(testImmDir, 'audit-ledger.jsonl'), 'utf8');
+
+        // Hívjuk a recovery-t rossz admin kulccsal egyedi IP-ről
+        const resBadAdmin = await makeRequest('POST', '/api/audit/recovery', { 'X-Forwarded-For': '10.200.1.1', 'X-TMPSP-Admin-Key': 'BAD' });
+        const postLedgerContent = fs.readFileSync(path.join(testImmDir, 'audit-ledger.jsonl'), 'utf8');
+
+        apiResults.push({
+          id: 'CI-002-IMM',
+          nev: 'AUD-007: Sikertelen Recovery Esetén Az Eredeti Ledger és Bizonyítékok Változatlanok',
+          sikeres: resBadAdmin.status === 403 && origLedgerContent === postLedgerContent,
+          vart: 'HTTP 403, origLedgerContent === postLedgerContent',
+          kapott: `HTTP ${resBadAdmin.status}, sameContent = ${origLedgerContent === postLedgerContent}`,
+        });
+      } finally {
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testImmDir, { recursive: true, force: true }); } catch {}
+      }
+
+      // 24. CI-002-ORD: Sikeres recovery pontos végrehajtási sorrendje (archiválás -> ellenőrzés -> újrainicializálás)
+      const testOrdDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmpsp-ord-'));
+      process.env.TMPSP_DATA_DIR = testOrdDir;
+      try {
+        initializeFreshLedgerAndAnchor();
+        fs.unlinkSync(path.join(testOrdDir, 'trust-anchor.json')); // Enter quarantine
+        startupIntegrityCheck();
+
+        const resRecoveryGood = await makeRequest('POST', '/api/audit/recovery', { 'X-Forwarded-For': '10.200.1.2', 'X-TMPSP-Admin-Key': TEST_ADMIN_KEY });
+        const isOperational = resRecoveryGood.body?.serverIntegrityState === 'OPERATIONAL';
+        const bundleDirName = resRecoveryGood.body?.archivedBundleDir;
+        const bundlePath = bundleDirName ? path.join(testOrdDir, bundleDirName) : '';
+        const verifyBundlePost = bundlePath ? verifyForensicBundle(bundlePath, path.join(bundlePath, 'forensic-manifest.json')) : { isValid: false };
+
+        apiResults.push({
+          id: 'CI-002-ORD',
+          nev: 'AUD-007: Sikeres Recovery Végrehajtási Sorrendje (Archiválás -> Ellenőrzés -> Újrainicializálás)',
+          sikeres: resRecoveryGood.status === 200 && isOperational && verifyBundlePost.isValid,
+          vart: 'HTTP 200, state = OPERATIONAL, archived bundle verified = true',
+          kapott: `HTTP ${resRecoveryGood.status}, state = ${resRecoveryGood.body?.serverIntegrityState}, bundleVerified = ${verifyBundlePost.isValid}`,
+        });
+      } finally {
+        app.set('trust proxy', false);
+        process.env.TMPSP_DATA_DIR = tmpDataDir;
+        try { fs.rmSync(testOrdDir, { recursive: true, force: true }); } catch {}
+      }
+
+      // 25. CI-002-EXT: Telepítési állapot külső bizalmi horgony illesztőfelület tesztje (AUD-008)
+      const { EnvOrFileExternalTrustAnchorAdapter } = await import('./externalTrustAnchor.ts');
+      const extAdapter = new EnvOrFileExternalTrustAnchorAdapter();
+      const extUnconfigured = extAdapter.isConfigured() === false;
+      const extVerifyUnconf = await extAdapter.verifyExternalInitialization('TMPSP-MAIN');
+
+      apiResults.push({
+        id: 'CI-002-EXT',
+        nev: 'AUD-008: External Trust Anchor Adapter Illesztőfelület és Konfigurációs Ellenőrzés',
+        sikeres: extUnconfigured && Boolean(extVerifyUnconf.error?.includes('BLOCKED_EXTERNAL_TRUST_ANCHOR')),
+        vart: 'isConfigured = false, error contains BLOCKED_EXTERNAL_TRUST_ANCHOR',
+        kapott: `isConfigured = ${!extUnconfigured}, err = ${extVerifyUnconf.error}`,
+      });
     } finally {
       try { fs.rmSync(childDir, { recursive: true, force: true }); } catch {}
     }

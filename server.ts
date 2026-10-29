@@ -109,30 +109,60 @@ function timingSafeCompare(a: string, b: string): boolean {
 }
 
 /**
- * Incidens naplózása a quarantine-incident.json, quarantine-incidents.jsonl és egyedi időbélyeges fájlba (AUD-003)
+ * Incidens naplózása a quarantine-incident.json, quarantine-incidents.jsonl és egyedi, ütközésmentes
+ * atomic bizonyítékfájlba (AUD-006: fs.openSync mit 'wx' flag).
  */
-function recordQuarantineIncident(errorCode: string, brokenIndex: number | null, reason: string): void {
+function recordQuarantineIncident(errorCode: string, brokenIndex: number | null, reason: string): string {
   ensureDataDirExists();
   const incidentTimestamp = new Date().toISOString();
-  const incidentData = {
-    incidentTimestamp,
-    errorCode,
-    brokenIndex,
-    reason,
-    ledgerPath: getAUDIT_LEDGER_FILE(),
-    action: 'QUARANTINE_MODE_ACTIVE - Minden naplóírás zárolva, bizonyíték változatlanul megőrizve.',
-  };
   
-  // 1. Mindig frissítjük a legutóbbi incidens mutatóját
-  fs.writeFileSync(getQUARANTINE_INCIDENT_FILE(), JSON.stringify(incidentData, null, 2), 'utf8');
-  
-  // 2. Append-only napló (quarantine-incidents.jsonl) az összes incidens megőrzésére
-  fs.appendFileSync(getQUARANTINE_INCIDENTS_LOG(), JSON.stringify(incidentData) + '\n', 'utf8');
+  let created = false;
+  let attempts = 0;
+  let incidentId = '';
+  let uniqueFileName = '';
+  let uniqueFilePath = '';
 
-  // 3. Egyedi időbélyeges bizonyítékfájl mentése (quarantine-incident-<timestamp>.json)
-  const safeTs = incidentTimestamp.replace(/[:.]/g, '-');
-  const uniqueFile = path.resolve(getDATA_DIR(), `quarantine-incident-${safeTs}.json`);
-  fs.writeFileSync(uniqueFile, JSON.stringify(incidentData, null, 2), 'utf8');
+  while (!created && attempts < 10) {
+    attempts++;
+    const randomSuffix = crypto.randomBytes(4).toString('hex');
+    incidentId = `INC-${incidentTimestamp.replace(/[:.]/g, '-')}-${randomSuffix}`;
+    uniqueFileName = `quarantine-incident-${incidentId}.json`;
+    uniqueFilePath = path.resolve(getDATA_DIR(), uniqueFileName);
+
+    const incidentData = {
+      incidentId,
+      incidentTimestamp,
+      errorCode,
+      brokenIndex,
+      reason,
+      ledgerPath: getAUDIT_LEDGER_FILE(),
+      evidenceFilePath: uniqueFileName,
+      action: 'QUARANTINE_MODE_ACTIVE - Minden naplóírás zárolva, bizonyíték változatlanul megőrizve.',
+    };
+
+    try {
+      // Atomic kizárólagos fájllétrehozás: 'wx' (elbukik EEXIST-tel, ha a fájl már létezik - AUD-006)
+      fs.writeFileSync(uniqueFilePath, JSON.stringify(incidentData, null, 2), { flag: 'wx', encoding: 'utf8' });
+      created = true;
+
+      // 1. Legutóbbi incidens mutatójának frissítése (gyorselérési segédlet, nem az elsődleges forrás)
+      fs.writeFileSync(getQUARANTINE_INCIDENT_FILE(), JSON.stringify(incidentData, null, 2), 'utf8');
+
+      // 2. Append-only napló (quarantine-incidents.jsonl) frissítése
+      fs.appendFileSync(getQUARANTINE_INCIDENTS_LOG(), JSON.stringify(incidentData) + '\n', 'utf8');
+    } catch (err: any) {
+      if (err.code === 'EEXIST') {
+        continue;
+      }
+      throw new Error(`INCIDENT_RECORDING_FAILED: Nem sikerült a bizonyítékfájl mentése (${err.message}).`);
+    }
+  }
+
+  if (!created) {
+    throw new Error('INCIDENT_RECORDING_FAILED: Nem sikerült ütközésmentes bizonyítékfájlt létrehozni 10 próbálkozás után.');
+  }
+
+  return incidentId;
 }
 
 /**
@@ -559,10 +589,156 @@ app.get('/api/audit/verify', (req, res) => {
   }
 });
 
-// API: Adminisztratív helyreállítási protokoll (AUD-001 KÖVETELMÉNY)
+export interface ForensicManifestFileEntry {
+  relativePath: string;
+  fileSize: number;
+  sha256: string;
+  statusAtArchiving: 'EXISTING' | 'READ_ERROR';
+}
+
+export interface ForensicManifest {
+  manifestVersion: string;
+  archivedAt: string;
+  recoveryTriggeredBy: string;
+  previousIntegrityState: string;
+  lastIntegrityErrorCode: string | null;
+  lastIntegrityError: string | null;
+  files: ForensicManifestFileEntry[];
+}
+
+/**
+ * Forenzikus archívum létrehozása az ÖSSZES bizonyítékfájlból (AUD-007)
+ */
+function createForensicBundle(): { bundleDir: string; bundleName: string; manifestPath: string; manifestData: ForensicManifest } {
+  ensureDataDirExists();
+  const archiveTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const bundleName = `archived-forensic-bundle-${archiveTimestamp}`;
+  const bundleDir = path.resolve(getDATA_DIR(), bundleName);
+  fs.mkdirSync(bundleDir, { recursive: true });
+
+  const dataDir = getDATA_DIR();
+  const allFilesInDir = fs.readdirSync(dataDir, { withFileTypes: true });
+
+  const sourceFilesToArchive: string[] = [];
+  for (const item of allFilesInDir) {
+    if (item.isFile() && !item.name.startsWith('.')) {
+      sourceFilesToArchive.push(item.name);
+    }
+  }
+
+  const manifestEntries: ForensicManifestFileEntry[] = [];
+
+  for (const fileName of sourceFilesToArchive) {
+    const srcPath = path.resolve(dataDir, fileName);
+    const destPath = path.resolve(bundleDir, fileName);
+
+    if (!destPath.startsWith(bundleDir)) {
+      throw new Error(`FORENSIC_PATH_TRAVERSAL_DETECTED: '..' vagy nem megengedett útvonal (${fileName})`);
+    }
+
+    try {
+      const contentBuffer = fs.readFileSync(srcPath);
+      const sha256 = crypto.createHash('sha256').update(contentBuffer).digest('hex');
+      fs.copyFileSync(srcPath, destPath);
+
+      manifestEntries.push({
+        relativePath: fileName,
+        fileSize: contentBuffer.length,
+        sha256,
+        statusAtArchiving: 'EXISTING',
+      });
+    } catch {
+      manifestEntries.push({
+        relativePath: fileName,
+        fileSize: 0,
+        sha256: '',
+        statusAtArchiving: 'READ_ERROR',
+      });
+    }
+  }
+
+  const manifestData: ForensicManifest = {
+    manifestVersion: '1.0-forensic',
+    archivedAt: new Date().toISOString(),
+    recoveryTriggeredBy: 'ADMIN_RECOVERY_PROTOCOL',
+    previousIntegrityState: serverIntegrityState,
+    lastIntegrityErrorCode,
+    lastIntegrityError,
+    files: manifestEntries,
+  };
+
+  const manifestPath = path.resolve(bundleDir, 'forensic-manifest.json');
+  fs.writeFileSync(manifestPath, JSON.stringify(manifestData, null, 2), 'utf8');
+
+  return { bundleDir, bundleName, manifestPath, manifestData };
+}
+
+/**
+ * Forenzikus archívum szigorú, fail-closed pre-recovery ellenőrzése (AUD-007)
+ */
+function verifyForensicBundle(bundleDir: string, manifestPath: string): { isValid: boolean; error?: string } {
+  if (!fs.existsSync(bundleDir)) {
+    return { isValid: false, error: `A bundle könyvtár nem létezik: ${bundleDir}` };
+  }
+  if (!fs.existsSync(manifestPath)) {
+    return { isValid: false, error: `A forensic-manifest.json nem létezik: ${manifestPath}` };
+  }
+
+  let manifest: ForensicManifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  } catch (err: any) {
+    return { isValid: false, error: `A manifest érvénytelen JSON: ${err.message}` };
+  }
+
+  if (manifest.manifestVersion !== '1.0-forensic' || !Array.isArray(manifest.files)) {
+    return { isValid: false, error: 'A manifest verziója vagy szerkezete érvénytelen.' };
+  }
+
+  const seenPaths = new Set<string>();
+
+  for (const entry of manifest.files) {
+    if (!entry.relativePath || typeof entry.relativePath !== 'string') {
+      return { isValid: false, error: 'Hiányzó vagy érvénytelen relativePath a manifestben.' };
+    }
+
+    if (path.isAbsolute(entry.relativePath) || entry.relativePath.includes('..')) {
+      return { isValid: false, error: `Útvonalbejárási kísérlet (Path Traversal) detektálva: ${entry.relativePath}` };
+    }
+
+    if (seenPaths.has(entry.relativePath)) {
+      return { isValid: false, error: `Duplikált fájlútvonal a manifestben: ${entry.relativePath}` };
+    }
+    seenPaths.add(entry.relativePath);
+
+    if (entry.statusAtArchiving === 'EXISTING') {
+      const fileInBundle = path.resolve(bundleDir, entry.relativePath);
+      if (!fileInBundle.startsWith(bundleDir)) {
+        return { isValid: false, error: `Bundle-en kívülre mutató hivatkozás: ${entry.relativePath}` };
+      }
+
+      if (!fs.existsSync(fileInBundle)) {
+        return { isValid: false, error: `Az archivált fájl hiányzik a bundle mappából: ${entry.relativePath}` };
+      }
+
+      const rawBuffer = fs.readFileSync(fileInBundle);
+      if (rawBuffer.length !== entry.fileSize) {
+        return { isValid: false, error: `Fájlméret eltérés (${entry.relativePath}): elvárt ${entry.fileSize} B, kapott ${rawBuffer.length} B` };
+      }
+
+      const actualHash = crypto.createHash('sha256').update(rawBuffer).digest('hex');
+      if (actualHash !== entry.sha256) {
+        return { isValid: false, error: `SHA-256 hash eltérés (${entry.relativePath}): elvárt ${entry.sha256}, kapott ${actualHash}` };
+      }
+    }
+  }
+
+  return { isValid: true };
+}
+
+// API: Adminisztratív helyreállítási protokoll (AUD-001 & AUD-007 KÖVETELMÉNY)
 // Szigorúan védett timing-safe módon, SIKERTELEN KÍSÉRLET ALAPÚ IP RATE LIMIT-tel, KIZÁRÓLAG INTEGRITY_FAILURE MÓDBAN!
 app.post('/api/audit/recovery', (req, res) => {
-  // 1. Szigorú üzemi állapot szűrő: rendes üzemi állapotban tilos a napló törlése/újraindítása!
   if (serverIntegrityState !== 'INTEGRITY_FAILURE') {
     return res.status(409).json({
       success: false,
@@ -570,11 +746,9 @@ app.post('/api/audit/recovery', (req, res) => {
     });
   }
 
-  // 2. IP-alapú Rate Limiter kizárólag a SIKERTELEN próbálkozásokra (DoS védelem)
-  // req.ip-t használunk, amelyet az Express a megbízható proxyláncból számít ki
   const clientIp = req.ip || req.socket?.remoteAddress || 'unknown-client';
-
   const now = Date.now();
+
   if (failedRecoveryAttemptsMap.size > 10000) {
     for (const [ip, ts] of failedRecoveryAttemptsMap) {
       if (ts.every((t) => now - t >= 15 * 60 * 1000)) failedRecoveryAttemptsMap.delete(ip);
@@ -600,7 +774,6 @@ app.post('/api/audit/recovery', (req, res) => {
   const adminKey = req.headers['x-tmpsp-admin-key'] || req.body?.adminKey;
 
   if (typeof adminKey !== 'string' || !timingSafeCompare(adminKey, ADMIN_RECOVERY_KEY)) {
-    // SIKERTELEN kísérlet regisztrálása ehhez az IP-hez
     clientFailures.push(now);
     failedRecoveryAttemptsMap.set(clientIp, clientFailures);
     return res.status(403).json({
@@ -609,70 +782,37 @@ app.post('/api/audit/recovery', (req, res) => {
     });
   }
 
-  // Sikeres hitelesítés törli az IP hibaszámlálóját
   failedRecoveryAttemptsMap.delete(clientIp);
 
   try {
-    // 1. Az ÖSSZES meglévő állapoti és incidens bizonyíték forenzikus csomagba gyűjtése (AUD-005)
-    const archiveTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const bundleName = `archived-forensic-bundle-${archiveTimestamp}`;
-    const bundleDir = path.resolve(getDATA_DIR(), bundleName);
-    fs.mkdirSync(bundleDir, { recursive: true });
+    // 1. Forenzikus csomag létrehozása az ÖSSZES bizonyítékfájlból (AUD-007)
+    const bundleInfo = createForensicBundle();
 
-    const filesToBundle = [
-      { name: 'audit-ledger.jsonl', path: getAUDIT_LEDGER_FILE() },
-      { name: 'trust-anchor.json', path: getTRUST_ANCHOR_FILE() },
-      { name: 'quarantine-incident.json', path: getQUARANTINE_INCIDENT_FILE() },
-      { name: 'quarantine-incidents.jsonl', path: getQUARANTINE_INCIDENTS_LOG() },
-      { name: 'system-init.json', path: getSYSTEM_INIT_MARKER_FILE() },
-    ];
-
-    const archivedFilesInfo: Array<{ filename: string; size: number; sha256: string }> = [];
-
-    for (const fileInfo of filesToBundle) {
-      if (fs.existsSync(fileInfo.path)) {
-        const destPath = path.resolve(bundleDir, fileInfo.name);
-        fs.copyFileSync(fileInfo.path, destPath);
-        const contentBuffer = fs.readFileSync(destPath);
-        const sha256 = crypto.createHash('sha256').update(contentBuffer).digest('hex');
-        archivedFilesInfo.push({
-          filename: fileInfo.name,
-          size: contentBuffer.length,
-          sha256,
-        });
-      }
+    // 2. Szigorú, fail-closed pre-recovery ellenőrzés (AUD-007)
+    const verification = verifyForensicBundle(bundleInfo.bundleDir, bundleInfo.manifestPath);
+    if (!verification.isValid) {
+      throw new Error(`FORENSIC_BUNDLE_VERIFICATION_FAILED: ${verification.error}`);
     }
 
-    const manifestPath = path.resolve(bundleDir, 'forensic-manifest.json');
-    const manifestData = {
-      archivedAt: new Date().toISOString(),
-      recoveryTriggeredBy: 'ADMIN_RECOVERY_PROTOCOL',
-      previousIntegrityState: serverIntegrityState,
-      lastIntegrityErrorCode,
-      lastIntegrityError,
-      archivedFilesCount: archivedFilesInfo.length,
-      files: archivedFilesInfo,
-    };
-    fs.writeFileSync(manifestPath, JSON.stringify(manifestData, null, 2), 'utf8');
+    console.log(`[TMPSP AUDIT RECOVERY] Teljes állapoti bizonyíték archiválva és visszaellenőrizve: ${bundleInfo.bundleDir}`);
 
-    if (!fs.existsSync(bundleDir) || !fs.existsSync(manifestPath)) {
-      throw new Error('FORENSIC_BUNDLE_FAILED: A forenzikus archiválási csomag nem hozható létre.');
-    }
-
-    console.log(`[TMPSP AUDIT RECOVERY] Teljes állapoti bizonyíték archiválva forenzikus csomagba: ${bundleDir}`);
-
-    // 2. Új tiszta állapot és bizalmi horgony felépítése
+    // 3. KIZÁRÓLAG sikeres archiválás és visszaellenőrzés után inicializálható az új tiszta napló!
     initializeFreshLedgerAndAnchor();
 
     res.json({
       success: true,
-      message: 'Audit napló helyreállítása sikeres. A teljes forenzikus bizonyítékcsomag archiválásra került.',
-      archivedBundleDir: bundleName,
+      message: 'Audit napló helyreállítása sikeres. A teljes forenzikus bizonyítékcsomag archiválásra és visszaellenőrzésre került.',
+      archivedBundleDir: bundleInfo.bundleName,
       manifestFile: 'forensic-manifest.json',
       serverIntegrityState: 'OPERATIONAL',
     });
   } catch (error: any) {
-    res.status(500).json({ success: false, error: error.message });
+    // Hiba esetén a helyreállítás LEÁLL, a meglévő bizonyítékok és az eredeti állapot VÁLTOZATLANUL megmaradnak!
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      serverIntegrityState: 'INTEGRITY_FAILURE',
+    });
   }
 });
 
@@ -707,6 +847,9 @@ export {
   getQUARANTINE_INCIDENTS_LOG,
   getSYSTEM_INIT_MARKER_FILE,
   getQUARANTINE_INCIDENT_FILE,
+  recordQuarantineIncident,
+  createForensicBundle,
+  verifyForensicBundle,
 };
 
 const isMainModule = process.argv[1] && (process.argv[1].endsWith('server.ts') || process.argv[1].endsWith('server.js'));
