@@ -11,6 +11,10 @@ export type StateMachineStatus =
   | 'ZÖLD' 
   | 'SÁRGA - ELŐZETES' 
   | 'PIROS' 
+  // A 'KORRIGÁLT ZÖLD' és 'NEM_ELLENŐRIZHETŐ (ADATHIÁNY)' állapotok megőrzésre kerültek
+  // a történeti audit naplók és külső felületek típuskompatibilitása érdekében.
+  // A TMPSP v2.1 döntési modellben az adathiány nem modul-státusz, hanem a független
+  // 'adatminosegiAllapot' ('TELJES' | 'HIÁNYOS') dimenzióként jelenik meg.
   | 'KORRIGÁLT ZÖLD' 
   | 'NEM_ELLENŐRIZHETŐ (ADATHIÁNY)';
 
@@ -58,6 +62,7 @@ export interface QuarterDataRow {
   szamlaloErtek?: number;  // nyers számláló (ha van)
   nevezoErtek?: number;    // nyers nevező (ha van)
   szamitottErtek?: number; // számított indikátorérték
+  esetszam?: number;       // mintaszám / megfigyelési darabszám (pl. 2.4 likviditási bypasshoz min. 30)
   drl: DataReadinessLevel;
   megjegyzes?: string;
 }
@@ -71,6 +76,8 @@ export interface IndicatorCalculationResult {
   kuszobErtek: number;
   kuszobTipus: '>' | '<';
   atlepte: boolean;
+  teljesFeltetel: boolean | null; // null = kiegészítő feltétel nem ellenőrizhető (pl. hiányzó segédadat)
+  feltetelMagyarazat: string;     // feltétel teljesülésének vagy elmaradásának indoklása
   kuszobStatusz: ThresholdStatus;
   drl: DataReadinessLevel;
   yoyDelta?: number | null;
@@ -84,7 +91,8 @@ export interface ModuleEvaluationResult {
   modulId: ModuleId;
   modulNev: string;
   statusz: StateMachineStatus;
-  kivaltoIndikatorok: string[];
+  kivaltoIndikatorok: string[]; // csak teljesFeltetel === true esetén
+  figyelojelzesek: string[];    // atlepte === true, de teljesFeltetel hamis vagy null (nem emeli sárgára a modult)
   indoklas: string;
   akcioterv: string;
   adatminosegiFigyelmeztetes: boolean;
@@ -95,6 +103,7 @@ export interface ModuleEvaluationResult {
 export interface IntegratedStateResult {
   negyedev: string;
   globalisStatusz: StateMachineStatus;
+  adatminosegiAllapot: 'TELJES' | 'HIÁNYOS'; // HIÁNYOS, ha bármely sor DRL-je HOZZÁFÉRÉS_KÉRDÉSES vagy NEM_ELÉRHETŐ
   modulok: Record<ModuleId, ModuleEvaluationResult>;
   figyelmeztetesek: string[];
   szukKeresztmetszet: string;

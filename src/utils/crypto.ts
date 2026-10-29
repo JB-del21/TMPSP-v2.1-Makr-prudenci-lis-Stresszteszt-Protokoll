@@ -1,7 +1,4 @@
-/**
- * TMPSP v2.1 Kriptográfiai Hash Segédeszközök
- * Web Crypto API alapú SHA-256 hash generálás és láncolás.
- */
+import { canonicalJsonStringify } from '../engine/canonicalJson';
 
 export async function computeSha256(input: string): Promise<string> {
   const encoder = new TextEncoder();
@@ -16,7 +13,7 @@ export async function computeChainedHash(
   timestamp: string,
   payload: Record<string, unknown>
 ): Promise<string> {
-  const serialized = JSON.stringify(payload, Object.keys(payload).sort());
+  const serialized = canonicalJsonStringify(payload);
   const combined = `${prevHash}|${timestamp}|${serialized}`;
   return computeSha256(combined);
 }

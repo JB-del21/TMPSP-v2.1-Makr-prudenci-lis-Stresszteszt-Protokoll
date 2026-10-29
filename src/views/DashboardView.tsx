@@ -132,9 +132,20 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               Negyedév: <span className="font-mono text-slate-200">{currentQuarter}</span> · Konzervatív perzisztencia- és adathiány-kezelés
             </p>
           </div>
-          <div className="text-right">
+          <div className="text-right flex flex-col items-end gap-1">
             <span className="text-[11px] text-slate-500 uppercase tracking-wider block">Aktuális Globális Állapot</span>
-            <span className="text-xs font-bold text-white font-mono">{currentStatus}</span>
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-bold text-white font-mono">{currentStatus}</span>
+              <span
+                className={`text-[11px] font-mono px-2 py-0.5 rounded border uppercase font-semibold ${
+                  integratedState.adatminosegiAllapot === 'TELJES'
+                    ? 'bg-emerald-950/60 border-emerald-700 text-emerald-300'
+                    : 'bg-amber-950/80 border-amber-600 text-amber-300'
+                }`}
+              >
+                Adatminőség: {integratedState.adatminosegiAllapot}
+              </span>
+            </div>
           </div>
         </div>
 

@@ -277,6 +277,7 @@ export default function App() {
           currentQuarter={currentQuarter}
           onQuarterChange={setCurrentQuarter}
           globalStatus={integratedState.globalisStatusz}
+          adatminosegiAllapot={integratedState.adatminosegiAllapot}
           isSynthetic={isSynthetic}
           isProjection={isProjection}
           onExportXlsx={handleExportXlsx}

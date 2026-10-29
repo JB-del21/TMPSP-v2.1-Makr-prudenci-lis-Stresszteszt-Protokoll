@@ -15,6 +15,7 @@ interface HeaderProps {
   currentQuarter: string;
   onQuarterChange: (q: string) => void;
   globalStatus: StateMachineStatus;
+  adatminosegiAllapot?: 'TELJES' | 'HIÁNYOS';
   isSynthetic: boolean;
   isProjection?: boolean;
   onExportXlsx: () => void;
@@ -26,6 +27,7 @@ export const Header: React.FC<HeaderProps> = ({
   currentQuarter,
   onQuarterChange,
   globalStatus,
+  adatminosegiAllapot = 'TELJES',
   isSynthetic,
   isProjection = false,
   onExportXlsx,
@@ -117,7 +119,23 @@ export const Header: React.FC<HeaderProps> = ({
 
       {/* 3. ZÓNA: Állapotjelző és Export Akciók */}
       <div className="flex items-center gap-3 shrink-0">
-        <div className="hidden lg:block">{getStatusBadge()}</div>
+        <div className="hidden lg:flex items-center gap-2">
+          {getStatusBadge()}
+          <span
+            className={`px-2.5 py-1 rounded text-xs font-mono font-semibold uppercase tracking-wider border ${
+              adatminosegiAllapot === 'TELJES'
+                ? 'bg-emerald-950/60 border-emerald-700 text-emerald-300'
+                : 'bg-amber-950/80 border-amber-600 text-amber-300'
+            }`}
+            title={
+              adatminosegiAllapot === 'TELJES'
+                ? 'Minden mérési sorhoz rendelkezésre áll igazolt vagy proxy adat'
+                : 'Legalább egy mérési sornál adathiány vagy kérdéses hozzáférés áll fenn'
+            }
+          >
+            Adatminőség: {adatminosegiAllapot}
+          </span>
+        </div>
 
         <div className="flex items-center gap-2">
           <button

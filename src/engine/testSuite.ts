@@ -40,7 +40,14 @@
 import { sha256Utf8 } from './sha256';
 import { canonicalJsonStringify, CanonicalJsonError } from './canonicalJson';
 import { calculateIndicatorValue } from './calculator';
-import { evaluateModule2, evaluateIntegratedStateMachine } from './stateMachine';
+import {
+  evaluateModule1,
+  evaluateModule2,
+  evaluateModule3,
+  evaluateModule4,
+  evaluateIntegratedStateMachine,
+  ESZKALACIOS_MODUL_SZAM,
+} from './stateMachine';
 import { runThresholdBacktest } from './calibration';
 import {
   computeCanonicalRecordHash,
@@ -50,8 +57,9 @@ import {
   TrustAnchor,
   GENESIS_PREV_HASH,
 } from './cryptoNode';
-import { IndicatorMeta, QuarterDataRow } from './types';
-import { MEASUREMENT_SERIES_META } from '../data/tmpspData';
+import { IndicatorMeta, QuarterDataRow, IndicatorCalculationResult } from './types';
+import { MEASUREMENT_SERIES_META, INITIAL_QUARTERLY_DATA } from '../data/tmpspData';
+import { generateAlertStateExportRows } from '../utils/exportXlsx';
 
 export type TestCategory =
   | 'SHA256_FIPS_UNICODE'
@@ -62,7 +70,9 @@ export type TestCategory =
   | 'ADATHIÁNY'
   | 'KALIBRÁCIÓ'
   | 'WORM_INTEGRITÁS'
-  | 'ADAT_EREDET';
+  | 'ADAT_EREDET'
+  | 'ÁLLAPOTGÉP_SZABÁLYOK'
+  | 'EXPORT_VALIDÁCIÓ';
 
 export interface TestResult {
   id: string;
@@ -456,7 +466,7 @@ export function runAllEngineTests(): TestResult[] {
   };
   const calc24Missing = calculateIndicatorValue(row24Missing, meta24, []);
   const mockCalcsM2 = {
-    '2.1': { ...calculateIndicatorValue({ negyedev: '2024Q1', sorId: '2.1', foid: '2.1', eredet: 'SZINTETIKUS_PILOT_2024Q1', drl: 'PROXY', szamlaloErtek: 119, nevezoErtek: 57 }, metaMap.get('2.1')!, []) },
+    '2.1': { ...calculateIndicatorValue({ negyedev: '2024Q1', sorId: '2.1', foid: '2.1', eredet: 'SZINTETIKUS_PILOT_2024Q1', drl: 'PROXY', szamlaloErtek: 90, nevezoErtek: 60 }, metaMap.get('2.1')!, []) },
     '2.2': { ...calculateIndicatorValue({ negyedev: '2024Q1', sorId: '2.2', foid: '2.2', eredet: 'SZINTETIKUS_PILOT_2024Q1', drl: 'PROXY', szamlaloErtek: 11.2, nevezoErtek: 100 }, metaMap.get('2.2')!, []) },
     '2.3': { ...calculateIndicatorValue({ negyedev: '2024Q1', sorId: '2.3', foid: '2.3', eredet: 'SZINTETIKUS_PILOT_2024Q1', drl: 'IGAZOLT', szamlaloErtek: 12.8, nevezoErtek: 47.1 }, metaMap.get('2.3')!, []) },
     '2.4': calc24Missing,
@@ -466,10 +476,10 @@ export function runAllEngineTests(): TestResult[] {
     id: 'DAT-001',
     kategoria: 'ADATHIÁNY',
     nev: '2.4 LGD-Shift Hiány: Likviditási bypass blokkolása',
-    leiras: 'Kritikus adathiány esetén a likviditási bypass szigorúan blokkolva marad, az állapotgép nem enged ZÖLD-et.',
-    sikeres: !evalM2.likviditasiBypassAktiv && !evalM2.likviditasiBypassEllenorizheto && evalM2.statusz === 'SÁRGA - ELŐZETES',
-    vart: 'bypassAktiv = false, bypassEllenorizheto = false, statusz = SÁRGA - ELŐZETES',
-    kapott: `bypassAktiv = ${evalM2.likviditasiBypassAktiv}, ellenorizheto = ${evalM2.likviditasiBypassEllenorizheto}, statusz = ${evalM2.statusz}`,
+    leiras: 'Kritikus adathiány esetén a likviditási bypass szigorúan blokkolva marad, de az adathiány önmagában nem emeli a modult SÁRGÁRA (ZÖLD marad adatminőségi figyelmeztetéssel).',
+    sikeres: !evalM2.likviditasiBypassAktiv && !evalM2.likviditasiBypassEllenorizheto && evalM2.statusz === 'ZÖLD' && evalM2.adatminosegiFigyelmeztetes,
+    vart: 'bypassAktiv = false, bypassEllenorizheto = false, statusz = ZÖLD, adatminosegiFigyelmeztetes = true',
+    kapott: `bypassAktiv = ${evalM2.likviditasiBypassAktiv}, ellenorizheto = ${evalM2.likviditasiBypassEllenorizheto}, statusz = ${evalM2.statusz}, adatminosegiFigyelmeztetes = ${evalM2.adatminosegiFigyelmeztetes}`,
   });
 
   // DAT-002: Zéróosztás és Érvénytelen Nevező Védelme
@@ -903,6 +913,344 @@ export function runAllEngineTests(): TestResult[] {
     sikeres: data002Success,
     vart: 'baseHasProj = false, baseHasSynth = false, mindkét flag false',
     kapott: `baseHasProj = ${baseHasProjWarning}, baseHasSynth = ${baseHasSynthWarning}, flags = [synth: ${baseEval.szintetikusFigyelmeztetes}, proj: ${baseEval.projekcioFigyelmeztetes}]`,
+  });
+
+  // =========================================================================
+  // 10. KATEGÓRIA: ÁLLAPOTGÉP ÉS KÜSZÖB SZABÁLYOK (FSM-001 – FSM-008)
+  // =========================================================================
+
+  // FSM-001: 2024Q2 1.2a 44.85% (< 45% küszöb átlépve), de YoY delta +3.43 pp (> -10 pp),
+  // ezért teljesFeltetel === false. M1 ZÖLD marad, figyelojelzesek-ben szerepel, kivaltoIndikatorok üres.
+  const rows2024Q2 = INITIAL_QUARTERLY_DATA.filter((r) => r.negyedev === '2024Q2');
+  const calcs2024Q2M1: Record<string, IndicatorCalculationResult> = {};
+  ['1.1', '1.2a', '1.2b', '1.3', '1.4'].forEach((sorId) => {
+    const row = rows2024Q2.find((r) => r.sorId === sorId);
+    if (row) {
+      calcs2024Q2M1[sorId] = calculateIndicatorValue(row, metaMap.get(sorId)!, INITIAL_QUARTERLY_DATA);
+    }
+  });
+  const evalM1_2024Q2 = evaluateModule1(calcs2024Q2M1);
+  const calc12a_2024Q2 = calcs2024Q2M1['1.2a'];
+  const fsm001Success =
+    calc12a_2024Q2.atlepte === true &&
+    calc12a_2024Q2.teljesFeltetel === false &&
+    calc12a_2024Q2.yoyDelta !== undefined &&
+    calc12a_2024Q2.yoyDelta !== null &&
+    calc12a_2024Q2.yoyDelta > -10 &&
+    evalM1_2024Q2.statusz === 'ZÖLD' &&
+    evalM1_2024Q2.figyelojelzesek.some((f) => f.includes('1.2a')) &&
+    !evalM1_2024Q2.kivaltoIndikatorok.some((k) => k.includes('1.2a'));
+
+  results.push({
+    id: 'FSM-001',
+    kategoria: 'ÁLLAPOTGÉP_SZABÁLYOK',
+    nev: '1.2a Kiegészítő YoY Feltétel: Nem aktivál, ha YoY delta > -10 pp (2024Q2)',
+    leiras: '2024Q2-ben az 1.2a értéke 44.85% (< 45%), de a YoY delta +3.43 pp, így a teljes feltétel nem teljesül; M1 ZÖLD marad és az 1.2a csak figyelőjelzés.',
+    sikeres: fsm001Success,
+    vart: 'atlepte = true, teljesFeltetel = false, statusz = ZÖLD, figyelojelzesek = [1.2a]',
+    kapott: `atlepte = ${calc12a_2024Q2.atlepte}, teljesFeltetel = ${calc12a_2024Q2.teljesFeltetel}, statusz = ${evalM1_2024Q2.statusz}, figy = ${JSON.stringify(evalM1_2024Q2.figyelojelzesek)}`,
+  });
+
+  // FSM-002: 2024Q1 1.2a 42.04% (< 45% küszöb átlépve) ÉS YoY delta -10.20 pp (<= -10 pp),
+  // ezért teljesFeltetel === true. M1 SÁRGA - ELŐZETES, kivaltoIndikatorok-ban szerepel az 1.2a.
+  const rows2024Q1 = INITIAL_QUARTERLY_DATA.filter((r) => r.negyedev === '2024Q1');
+  const calcs2024Q1M1: Record<string, IndicatorCalculationResult> = {};
+  ['1.1', '1.2a', '1.2b', '1.3', '1.4'].forEach((sorId) => {
+    const row = rows2024Q1.find((r) => r.sorId === sorId);
+    if (row) {
+      calcs2024Q1M1[sorId] = calculateIndicatorValue(row, metaMap.get(sorId)!, INITIAL_QUARTERLY_DATA);
+    }
+  });
+  const evalM1_2024Q1 = evaluateModule1(calcs2024Q1M1);
+  const calc12a_2024Q1 = calcs2024Q1M1['1.2a'];
+  const fsm002Success =
+    calc12a_2024Q1.atlepte === true &&
+    calc12a_2024Q1.teljesFeltetel === true &&
+    calc12a_2024Q1.yoyDelta !== undefined &&
+    calc12a_2024Q1.yoyDelta !== null &&
+    calc12a_2024Q1.yoyDelta <= -10 &&
+    evalM1_2024Q1.statusz === 'SÁRGA - ELŐZETES' &&
+    evalM1_2024Q1.kivaltoIndikatorok.some((k) => k.includes('1.2a'));
+
+  results.push({
+    id: 'FSM-002',
+    kategoria: 'ÁLLAPOTGÉP_SZABÁLYOK',
+    nev: '1.2a Teljes Feltétel Aktiválás: YoY delta <= -10 pp esetén SÁRGA (2024Q1)',
+    leiras: '2024Q1-ben az 1.2a értéke 42.04% és a YoY delta -10.20 pp, a teljes feltétel igazolt, M1 SÁRGA állapotba vált.',
+    sikeres: fsm002Success,
+    vart: 'atlepte = true, teljesFeltetel = true, statusz = SÁRGA - ELŐZETES, kivaltok = [1.2a]',
+    kapott: `atlepte = ${calc12a_2024Q1.atlepte}, teljesFeltetel = ${calc12a_2024Q1.teljesFeltetel}, statusz = ${evalM1_2024Q1.statusz}, kivaltok = ${JSON.stringify(evalM1_2024Q1.kivaltoIndikatorok)}`,
+  });
+
+  // FSM-003: 1.3 Perzisztencia Szabály: 1 negyedéves jelzés nem aktivál (teljesFeltetel === false),
+  // M1 ZÖLD marad, és az indikátor figyelőjelzésként jelenik meg.
+  const mockCalcsM1_13Single: Record<string, IndicatorCalculationResult> = {
+    '1.1': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '1.1', foid: '1.1', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'IGAZOLT', szamlaloErtek: 0.15, nevezoErtek: 200 }, metaMap.get('1.1')!, []),
+    '1.2a': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '1.2a', foid: '1.2', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'PROXY', szamlaloErtek: 5000, nevezoErtek: 10000 }, metaMap.get('1.2a')!, []),
+    '1.2b': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '1.2b', foid: '1.2', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'IGAZOLT', szamlaloErtek: 160, nevezoErtek: 200 }, metaMap.get('1.2b')!, []),
+    '1.3': calc13Single,
+    '1.4': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '1.4', foid: '1.4', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'IGAZOLT', szamlaloErtek: 60, nevezoErtek: 200 }, metaMap.get('1.4')!, []),
+  };
+  const evalM1_13Single = evaluateModule1(mockCalcsM1_13Single);
+  const fsm003Success =
+    calc13Single.atlepte === true &&
+    calc13Single.teljesFeltetel === false &&
+    evalM1_13Single.statusz === 'ZÖLD' &&
+    evalM1_13Single.figyelojelzesek.some((f) => f.includes('1.3')) &&
+    !evalM1_13Single.kivaltoIndikatorok.some((k) => k.includes('1.3'));
+
+  results.push({
+    id: 'FSM-003',
+    kategoria: 'ÁLLAPOTGÉP_SZABÁLYOK',
+    nev: '1.3 Perzisztencia Szabály: 1 negyedéves jelzés figyelőjelzés, modul ZÖLD marad',
+    leiras: 'Ha az 1.3 küszöböt lép át, de a perzisztencia nem igazolt (1 negyedév), nem aktivál SÁRGÁT, hanem figyelőjelzésként rögzül.',
+    sikeres: fsm003Success,
+    vart: 'atlepte = true, teljesFeltetel = false, statusz = ZÖLD, figy = [1.3]',
+    kapott: `atlepte = ${calc13Single.atlepte}, teljesFeltetel = ${calc13Single.teljesFeltetel}, statusz = ${evalM1_13Single.statusz}, figy = ${JSON.stringify(evalM1_13Single.figyelojelzesek)}`,
+  });
+
+  // FSM-004: Adathiány nem emel SÁRGÁRA, de az adatminosegiAllapot 'HIÁNYOS'
+  const normalCalcsAll: Record<string, IndicatorCalculationResult> = {
+    '1.1': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '1.1', foid: '1.1', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'IGAZOLT', szamlaloErtek: 0.15, nevezoErtek: 200 }, metaMap.get('1.1')!, []),
+    '1.2a': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '1.2a', foid: '1.2', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'PROXY', szamlaloErtek: 5000, nevezoErtek: 10000 }, metaMap.get('1.2a')!, []),
+    '1.2b': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '1.2b', foid: '1.2', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'IGAZOLT', szamlaloErtek: 160, nevezoErtek: 200 }, metaMap.get('1.2b')!, []),
+    '1.3': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '1.3', foid: '1.3', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'IGAZOLT', szamlaloErtek: 2000, nevezoErtek: 5000 }, metaMap.get('1.3')!, []),
+    '1.4': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '1.4', foid: '1.4', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'IGAZOLT', szamlaloErtek: 60, nevezoErtek: 200 }, metaMap.get('1.4')!, []),
+    '2.1': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '2.1', foid: '2.1', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'PROXY', szamlaloErtek: 90, nevezoErtek: 60 }, metaMap.get('2.1')!, []),
+    '2.2': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '2.2', foid: '2.2', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'PROXY', szamlaloErtek: 10, nevezoErtek: 100 }, metaMap.get('2.2')!, []),
+    '2.3': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '2.3', foid: '2.3', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'IGAZOLT', szamlaloErtek: 10, nevezoErtek: 50 }, metaMap.get('2.3')!, []),
+    '2.4': calc24Missing,
+    '3.1a': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '3.1a', foid: '3.1', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'PROXY', szamlaloErtek: 100, nevezoErtek: 500 }, metaMap.get('3.1a')!, []),
+    '3.1b': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '3.1b', foid: '3.1', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'PROXY', szamlaloErtek: 80, nevezoErtek: 300 }, metaMap.get('3.1b')!, []),
+    '3.2': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '3.2', foid: '3.2', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'IGAZOLT', szamlaloErtek: -1000, nevezoErtek: 800 }, metaMap.get('3.2')!, []),
+    '3.3': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '3.3', foid: '3.3', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'IGAZOLT', szamlaloErtek: 800, nevezoErtek: 30000 }, metaMap.get('3.3')!, []),
+    '4.1': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '4.1', foid: '4.1', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'IGAZOLT', szamlaloErtek: 1000, nevezoErtek: 80000 }, metaMap.get('4.1')!, []),
+    '4.2': calculateIndicatorValue({ negyedev: '2024Q1', sorId: '4.2', foid: '4.2', eredet: 'HISTÓRIKUS_BÁZIS_2023_2024', drl: 'PROXY', szamlaloErtek: 150, nevezoErtek: 180 }, metaMap.get('4.2')!, []),
+  };
+  const evalM2_Only24Missing = evaluateModule2(normalCalcsAll);
+  const evalIntegrated_24Missing = evaluateIntegratedStateMachine('2024Q1', normalCalcsAll, 'HISTÓRIKUS_BÁZIS_2023_2024');
+  const fsm004Success =
+    evalM2_Only24Missing.statusz === 'ZÖLD' &&
+    evalM2_Only24Missing.adatminosegiFigyelmeztetes === true &&
+    evalIntegrated_24Missing.adatminosegiAllapot === 'HIÁNYOS' &&
+    evalIntegrated_24Missing.globalisStatusz === 'ZÖLD';
+
+  results.push({
+    id: 'FSM-004',
+    kategoria: 'ÁLLAPOTGÉP_SZABÁLYOK',
+    nev: 'Adathiány Izoláció: Modul ZÖLD marad, Adatminőség: HIÁNYOS dimenzió',
+    leiras: 'A 2.4 adathiánya nem emeli az M2 modult SÁRGÁRA, a globális státusz ZÖLD marad, de az adatminőségi állapot HIÁNYOS jelölést kap.',
+    sikeres: fsm004Success,
+    vart: 'M2 statusz = ZÖLD, adatminosegiAllapot = HIÁNYOS, globalisStatusz = ZÖLD',
+    kapott: `M2 statusz = ${evalM2_Only24Missing.statusz}, adatminoseg = ${evalIntegrated_24Missing.adatminosegiAllapot}, global = ${evalIntegrated_24Missing.globalisStatusz}`,
+  });
+
+  // FSM-005: 2.4 LGD-Shift esetszám vizsgálata (N < 30 vagy hiányzik -> nincs bypass, N >= 30 -> bypass aktív)
+  const row24LowSample: QuarterDataRow = {
+    negyedev: '2024Q1',
+    sorId: '2.4',
+    foid: '2.4',
+    eredet: 'SZINTETIKUS_PILOT_2024Q1',
+    drl: 'IGAZOLT',
+    szamlaloErtek: 50,
+    nevezoErtek: 25, // 50 - 25 = 25 pp > 20 pp
+    esetszam: 18, // < 30
+  };
+  const calc24LowSample = calculateIndicatorValue(row24LowSample, metaMap.get('2.4')!, []);
+  const evalM2LowSample = evaluateModule2({ ...normalCalcsAll, '2.4': calc24LowSample });
+
+  const row24ValidSample: QuarterDataRow = {
+    negyedev: '2024Q1',
+    sorId: '2.4',
+    foid: '2.4',
+    eredet: 'SZINTETIKUS_PILOT_2024Q1',
+    drl: 'IGAZOLT',
+    szamlaloErtek: 50,
+    nevezoErtek: 25, // 25 pp > 20 pp
+    esetszam: 35, // >= 30
+  };
+  const calc24ValidSample = calculateIndicatorValue(row24ValidSample, metaMap.get('2.4')!, []);
+  const evalM2ValidSample = evaluateModule2({ ...normalCalcsAll, '2.4': calc24ValidSample });
+  const evalIntegratedValidSample = evaluateIntegratedStateMachine('2024Q1', { ...normalCalcsAll, '2.4': calc24ValidSample }, 'HISTÓRIKUS_BÁZIS_2023_2024');
+
+  const fsm005Success =
+    calc24LowSample.atlepte === true &&
+    calc24LowSample.teljesFeltetel === false &&
+    evalM2LowSample.likviditasiBypassAktiv === false &&
+    calc24ValidSample.atlepte === true &&
+    calc24ValidSample.teljesFeltetel === true &&
+    evalM2ValidSample.likviditasiBypassAktiv === true &&
+    evalIntegratedValidSample.globalisStatusz === 'PIROS';
+
+  results.push({
+    id: 'FSM-005',
+    kategoria: 'ÁLLAPOTGÉP_SZABÁLYOK',
+    nev: '2.4 LGD-Shift Esetszám Validáció: N < 30 cáfolat, N >= 30 esetén aktivál',
+    leiras: 'Ha 2.4 > 20 pp de N < 30, a kiegészítő esetszám-feltétel miatt cáfolva van (nincs bypass); N >= 30 esetén a bypass azonnal PIROS-ra vált.',
+    sikeres: fsm005Success,
+    vart: 'lowSample bypass = false, validSample bypass = true, globalisStatusz = PIROS',
+    kapott: `lowBypass = ${evalM2LowSample.likviditasiBypassAktiv}, validBypass = ${evalM2ValidSample.likviditasiBypassAktiv}, global = ${evalIntegratedValidSample.globalisStatusz}`,
+  });
+
+  // FSM-006: ESZKALACIOS_MODUL_SZAM (= 2) és Globális Eszkaláció
+  const calc11Triggered: IndicatorCalculationResult = {
+    ...normalCalcsAll['1.1'],
+    atlepte: true,
+    teljesFeltetel: true,
+    drl: 'IGAZOLT',
+    szamitottErtek: 0.18,
+  };
+  const calc32Triggered: IndicatorCalculationResult = {
+    ...normalCalcsAll['3.2'],
+    atlepte: true,
+    teljesFeltetel: true,
+    drl: 'IGAZOLT',
+    szamitottErtek: -3.5,
+  };
+  // 1 igazolt modul (M1)
+  const oneModuleTriggeredCalcs = {
+    ...normalCalcsAll,
+    '1.1': calc11Triggered,
+    '2.4': { ...calc24Missing, adathiany: false, drl: 'IGAZOLT' as const, szamitottErtek: 10, atlepte: false, teljesFeltetel: false },
+  };
+  const evalOneMod = evaluateIntegratedStateMachine('2024Q1', oneModuleTriggeredCalcs, 'HISTÓRIKUS_BÁZIS_2023_2024');
+
+  // 2 igazolt modul (M1 és M3)
+  const twoModuleTriggeredCalcs = {
+    ...oneModuleTriggeredCalcs,
+    '3.2': calc32Triggered,
+  };
+  const evalTwoMod = evaluateIntegratedStateMachine('2024Q1', twoModuleTriggeredCalcs, 'HISTÓRIKUS_BÁZIS_2023_2024');
+
+  const fsm006Success =
+    ESZKALACIOS_MODUL_SZAM === 2 &&
+    evalOneMod.globalisStatusz === 'SÁRGA - ELŐZETES' &&
+    evalTwoMod.globalisStatusz === 'PIROS';
+
+  results.push({
+    id: 'FSM-006',
+    kategoria: 'ÁLLAPOTGÉP_SZABÁLYOK',
+    nev: 'Globális Eszkaláció: ESZKALACIOS_MODUL_SZAM (= 2) Modul Romlása Esetén PIROS',
+    leiras: '1 igazolt romló modul SÁRGA globális állapotot ad; 2 igazolt romló modul eléri az ESZKALACIOS_MODUL_SZAM küszöböt, így PIROS állapotba eszkalál.',
+    sikeres: fsm006Success,
+    vart: 'ESZKALACIOS_MODUL_SZAM = 2, 1 modul = SÁRGA - ELŐZETES, 2 modul = PIROS',
+    kapott: `küszöb = ${ESZKALACIOS_MODUL_SZAM}, 1modul = ${evalOneMod.globalisStatusz}, 2modul = ${evalTwoMod.globalisStatusz}`,
+  });
+
+  // FSM-007: 2023Q3 2.4 LGD-Shift = 20.0 pp szigorú '>' összehasonlítás
+  const row24_2023Q3 = INITIAL_QUARTERLY_DATA.find((r) => r.negyedev === '2023Q3' && r.sorId === '2.4')!;
+  const calc24_2023Q3 = calculateIndicatorValue(row24_2023Q3, metaMap.get('2.4')!, INITIAL_QUARTERLY_DATA);
+  const fsm007Success =
+    calc24_2023Q3.szamitottErtek === 20 &&
+    calc24_2023Q3.atlepte === false &&
+    calc24_2023Q3.teljesFeltetel === false;
+
+  results.push({
+    id: 'FSM-007',
+    kategoria: 'ÁLLAPOTGÉP_SZABÁLYOK',
+    nev: 'Szigorú Küszöb-összehasonlítás: 2023Q3 2.4 értéke 20.0 pp nem lépi át a >20 pp küszöböt',
+    leiras: 'A szigorú összehasonlítás (>) miatt a pontosan 20.0 pp érték nem számít küszöbátlépésnek (atlepte = false).',
+    sikeres: fsm007Success,
+    vart: 'szamitottErtek = 20, atlepte = false, teljesFeltetel = false',
+    kapott: `szamitottErtek = ${calc24_2023Q3.szamitottErtek}, atlepte = ${calc24_2023Q3.atlepte}, teljesFeltetel = ${calc24_2023Q3.teljesFeltetel}`,
+  });
+
+  // FSM-008: Lebegőpontos Határérték Kerekítés (0.1 + 0.2 vs 0.3 szigorú > operátorral)
+  const mockMetaFloat: IndicatorMeta = {
+    sorId: 'FLOAT-TEST',
+    foid: 'F.1',
+    modulId: 'M1',
+    nev: 'Lebegőpontos Határérték Teszt',
+    kepletLeiras: '0.1 + 0.2 numerikus pontosság',
+    szamlaloNev: 'Sz',
+    nevezoNev: 'N',
+    egyseg: '%',
+    alapertelmezettDRL: 'IGAZOLT',
+    adatgazda: 'Teszt',
+    frissitesiGyakorisag: 'Q',
+    jeloltKuszob: '> 0.3',
+    kuszobTipus: '>',
+    kuszobErtek: 0.3,
+    kuszobStatusz: 'JELÖLT',
+    cafolatiFeltetel: 'Teszt',
+    felelos: 'Teszt',
+  };
+  const rowFloat: QuarterDataRow = {
+    negyedev: '2024Q1',
+    sorId: 'FLOAT-TEST',
+    foid: 'F.1',
+    eredet: 'HISTÓRIKUS_BÁZIS_2023_2024',
+    drl: 'IGAZOLT',
+    szamitottErtek: 0.1 + 0.2, // JS float-ban: 0.30000000000000004
+  };
+  const calcFloat = calculateIndicatorValue(rowFloat, mockMetaFloat, []);
+  const fsm008Success =
+    calcFloat.szamitottErtek === 0.3 &&
+    calcFloat.atlepte === false;
+
+  results.push({
+    id: 'FSM-008',
+    kategoria: 'ÁLLAPOTGÉP_SZABÁLYOK',
+    nev: 'Lebegőpontos Határérték Kerekítés (0.1 + 0.2 == 0.3 vs > 0.3)',
+    leiras: 'A 6 tizedesjegyre történő kerekítés megakadályozza a lebegőpontos túlcsordulásból eredő hamis pozitív riasztást.',
+    sikeres: fsm008Success,
+    vart: 'szamitottErtek = 0.3, atlepte = false',
+    kapott: `szamitottErtek = ${calcFloat.szamitottErtek}, atlepte = ${calcFloat.atlepte}`,
+  });
+
+  // =========================================================================
+  // 11. KATEGÓRIA: EXPORT VALIDÁCIÓ (EXP-001)
+  // =========================================================================
+
+  // EXP-001: Export Alert_State sorainak konzisztenciája az állapotgéppel
+  const alertExportRows = generateAlertStateExportRows(INITIAL_QUARTERLY_DATA);
+  let exp001Match = true;
+  let exp001Details = '';
+
+  const uniqueQuarters = Array.from(new Set(INITIAL_QUARTERLY_DATA.map((r) => r.negyedev)));
+  if (alertExportRows.length !== uniqueQuarters.length) {
+    exp001Match = false;
+    exp001Details = `Hossz eltérés: várt ${uniqueQuarters.length}, kapott ${alertExportRows.length}`;
+  } else {
+    for (const row of alertExportRows) {
+      const qRows = INITIAL_QUARTERLY_DATA.filter((r) => r.negyedev === row.negyedev);
+      const origin = qRows[0]?.eredet || 'HISTÓRIKUS_BÁZIS_2023_2024';
+
+      const calcs: Record<string, IndicatorCalculationResult> = {};
+      MEASUREMENT_SERIES_META.forEach((meta) => {
+        const r = qRows.find((item) => item.sorId === meta.sorId);
+        if (r) {
+          calcs[meta.sorId] = calculateIndicatorValue(r, meta, INITIAL_QUARTERLY_DATA);
+        }
+      });
+
+      const fsmState = evaluateIntegratedStateMachine(row.negyedev, calcs, origin);
+
+      if (
+        row.globalisStatusz !== fsmState.globalisStatusz ||
+        row.adatminosegiAllapot !== fsmState.adatminosegiAllapot ||
+        row.modul1 !== fsmState.modulok.M1.statusz ||
+        row.modul2 !== fsmState.modulok.M2.statusz ||
+        row.modul3 !== fsmState.modulok.M3.statusz ||
+        row.modul4 !== fsmState.modulok.M4.statusz ||
+        row.szukKeresztmetszet !== fsmState.szukKeresztmetszet ||
+        row.prioritasosAkcio !== fsmState.prioritasosAkcio
+      ) {
+        exp001Match = false;
+        exp001Details = `Eltérés a ${row.negyedev} negyedévben: export statusz="${row.globalisStatusz}", FSM statusz="${fsmState.globalisStatusz}"`;
+        break;
+      }
+    }
+  }
+
+  results.push({
+    id: 'EXP-001',
+    kategoria: 'EXPORT_VALIDÁCIÓ',
+    nev: 'Export Alert_State dinamikus generálás és állapotgép konzisztencia',
+    leiras: 'A generateAlertStateExportRows kimenete mind a 16 negyedévre szigorúan egyezik az állapotgép közvetlen kiértékelésével.',
+    sikeres: exp001Match,
+    vart: `Minden (${uniqueQuarters.length}) negyedévre 100%-os egyezés az állapotgéppel`,
+    kapott: exp001Match ? `${uniqueQuarters.length}/${uniqueQuarters.length} negyedév hibátlanul egyezik` : exp001Details,
   });
 
   return results;

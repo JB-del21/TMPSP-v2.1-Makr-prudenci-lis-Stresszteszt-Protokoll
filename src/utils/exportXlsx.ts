@@ -5,7 +5,85 @@
  */
 
 import * as XLSX from 'xlsx';
-import { AuditRecord, CalibrationItem, IndicatorMeta, QuarterDataRow } from '../engine/types';
+import { AuditRecord, CalibrationItem, IndicatorCalculationResult, IndicatorMeta, QuarterDataRow } from '../engine/types';
+import { calculateIndicatorValue } from '../engine/calculator';
+import { evaluateIntegratedStateMachine } from '../engine/stateMachine';
+import { MEASUREMENT_SERIES_META, INITIAL_QUARTERLY_DATA } from '../data/tmpspData';
+import { PRESET_SCENARIOS, calculateScenarioEffects, SCENARIO_UNCALIBRATED_NOTICE } from '../engine/scenarioModel';
+
+export interface AlertStateExportRow {
+  negyedev: string;
+  eredet: string;
+  globalisStatusz: string;
+  adatminosegiAllapot: string;
+  modul1: string;
+  modul2: string;
+  modul3: string;
+  modul4: string;
+  kivaltoJelzesek: string;
+  figyeloJelzesek: string;
+  szukKeresztmetszet: string;
+  prioritasosAkcio: string;
+}
+
+/**
+ * Dinamikus Alert_State sor-generáló segédfüggvény (egységtesztelhető)
+ */
+export function generateAlertStateExportRows(
+  dataRows: QuarterDataRow[] = INITIAL_QUARTERLY_DATA
+): AlertStateExportRow[] {
+  const quarters = Array.from(new Set(dataRows.map((r) => r.negyedev)));
+
+  return quarters.map((q) => {
+    const qRows = dataRows.filter((r) => r.negyedev === q);
+    const origin = qRows[0]?.eredet || 'HISTÓRIKUS_BÁZIS_2023_2024';
+
+    const calcs: Record<string, IndicatorCalculationResult> = {};
+    MEASUREMENT_SERIES_META.forEach((meta) => {
+      const row = qRows.find((r) => r.sorId === meta.sorId);
+      if (row) {
+        calcs[meta.sorId] = calculateIndicatorValue(row, meta, dataRows);
+      } else {
+        calcs[meta.sorId] = calculateIndicatorValue(
+          {
+            negyedev: q,
+            sorId: meta.sorId,
+            foid: meta.foid,
+            eredet: origin,
+            drl: meta.alapertelmezettDRL,
+          },
+          meta,
+          dataRows
+        );
+      }
+    });
+
+    const integratedState = evaluateIntegratedStateMachine(q, calcs, origin);
+
+    const m1 = integratedState.modulok.M1;
+    const m2 = integratedState.modulok.M2;
+    const m3 = integratedState.modulok.M3;
+    const m4 = integratedState.modulok.M4;
+
+    const kivaltok = [m1, m2, m3, m4].flatMap((m) => m.kivaltoIndikatorok);
+    const figyelok = [m1, m2, m3, m4].flatMap((m) => m.figyelojelzesek);
+
+    return {
+      negyedev: q,
+      eredet: origin,
+      globalisStatusz: integratedState.globalisStatusz,
+      adatminosegiAllapot: integratedState.adatminosegiAllapot,
+      modul1: m1.statusz,
+      modul2: m2.statusz,
+      modul3: m3.statusz,
+      modul4: m4.statusz,
+      kivaltoJelzesek: kivaltok.length > 0 ? kivaltok.join('; ') : 'Nincs',
+      figyeloJelzesek: figyelok.length > 0 ? figyelok.join('; ') : 'Nincs',
+      szukKeresztmetszet: integratedState.szukKeresztmetszet,
+      prioritasosAkcio: integratedState.prioritasosAkcio,
+    };
+  });
+}
 
 export function exportTmpspToExcel(
   metadata: IndicatorMeta[],
@@ -66,13 +144,37 @@ export function exportTmpspToExcel(
   XLSX.utils.book_append_sheet(wb, wsQData, 'Quarterly_Data');
 
   // 4. Lap: Stress_Scenarios
-  const scenarioHeaders = ['Forgatókönyv', 'Reáljövedelem_Sokk', 'DOM_Megnyúlás', 'Ingatlanár_Eltérés', 'Építőipari_Csődsokk', 'Várható_Tőkeveszteség', 'Garancialehívás_GDP'];
-  const scenarioRows = [
-    ['Alappálya (Baseline)', '0%', '0 nap', '+3.5%', 'Normál trend', 'Tőkepuffer < 10%', '1.96%'],
-    ['Kedvezőtlen sokk (Adverse)', '-15%', '+40 nap', '-10.0%', '+50% csődráta', 'Tőkepuffer 25-40%', '2.85%'],
-    ['Szélső sokk (Severe)', '-25%', '+90 nap', '-20.0%', '+100% csődráta', 'Tőkepuffer > 65%', '3.90%'],
+  const scenarioHeaders = [
+    'Forgatókönyv',
+    'Reáljövedelem_Sokk',
+    'DOM_Megnyúlás',
+    'Ingatlanár_Eltérés',
+    'Építőipari_Csődsokk',
+    'Várható_Tőkeveszteség',
+    'Garancialehívás_GDP',
+    'Szimulált_Állapot',
+    'Megjegyzés',
   ];
-  const wsScenario = XLSX.utils.aoa_to_sheet([scenarioHeaders, ...scenarioRows]);
+  const scenarioRows = PRESET_SCENARIOS.map((s) => {
+    const res = calculateScenarioEffects(s.input);
+    return [
+      s.name,
+      s.incomeText,
+      s.domText,
+      s.priceText,
+      s.bankruptcyText,
+      `${res.capitalBufferLoss.toFixed(1)}%`,
+      `${res.guaranteeDrawRate.toFixed(2)}%`,
+      res.expectedState,
+      SCENARIO_UNCALIBRATED_NOTICE,
+    ];
+  });
+  const wsScenario = XLSX.utils.aoa_to_sheet([
+    [`TMPSP v2.1 Stressz-Forgatókönyvek – ${SCENARIO_UNCALIBRATED_NOTICE}`],
+    [],
+    scenarioHeaders,
+    ...scenarioRows,
+  ]);
   XLSX.utils.book_append_sheet(wb, wsScenario, 'Stress_Scenarios');
 
   // 5. Lap: Threshold_Calibration
@@ -84,25 +186,35 @@ export function exportTmpspToExcel(
   XLSX.utils.book_append_sheet(wb, wsCalib, 'Threshold_Calibration');
 
   // 6. Lap: Alert_State
-  const alertHeaders = ['Negyedév', 'Adat_Eredete', 'Globális_Állapot', 'Modul_1', 'Modul_2', 'Modul_3', 'Modul_4', 'Szűk_Keresztmetszet', 'Prioritásos_Intézkedés'];
-  const alertRows = [
-    ['2023Q1', 'HISTÓRIKUS_BÁZIS_2023_2024', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Nincs', 'Rutin monitoring'],
-    ['2023Q2', 'HISTÓRIKUS_BÁZIS_2023_2024', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'Kamatsokk és hozzáférési szűkülés', 'Banki elutasítási vizsgálat'],
-    ['2023Q3', 'HISTÓRIKUS_BÁZIS_2023_2024', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'Piaci likviditás mélypont', 'Fedezeti puffer felülvizsgálat'],
-    ['2023Q4', 'HISTÓRIKUS_BÁZIS_2023_2024', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Enyhülő nyomás', 'Rutin monitoring'],
-    ['2024Q1', 'SZINTETIKUS_PILOT_2024Q1', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'ZÖLD', '550k-800k hozzáférés szűkülés, DOM olló', 'Kötelező 15 napos adategyeztetés KHR-rel és bankokkal'],
-    ['2024Q2', 'HISTÓRIKUS_BÁZIS_2023_2024', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Normalizálódó forgalom', 'Rutin monitoring'],
-    ['2024Q3', 'HISTÓRIKUS_BÁZIS_2023_2024', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Stabil hiteldinamika', 'Rutin monitoring'],
-    ['2024Q4', 'HISTÓRIKUS_BÁZIS_2023_2024', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Báziszárás és kalibrációs felülvizsgálat', 'Éves makroprudenciális jelentés'],
-    ['2025Q1', 'PROJEKCIÓ_2025_2026', 'SÁRGA - ELŐZETES', 'SÁRGA', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Előrejelzett JTM szigorodás', 'Modellkockázati monitoring'],
-    ['2025Q2', 'PROJEKCIÓ_2025_2026', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'ZÖLD', 'Projekciós DOM nyílás', 'Kockázati pályák futtatása'],
-    ['2025Q3', 'PROJEKCIÓ_2025_2026', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'Kedvezőtlen sokk pálya határán', 'Stresszteszt kalibráció'],
-    ['2025Q4', 'PROJEKCIÓ_2025_2026', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Stabilizálódó előrejelzés', 'Rutin projekciós monitoring'],
-    ['2026Q1', 'PROJEKCIÓ_2025_2026', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Projekciós bázis', 'Rutin monitoring'],
-    ['2026Q2', 'PROJEKCIÓ_2025_2026', 'SÁRGA - ELŐZETES', 'SÁRGA', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Előrejelzett hitelkereslet szűkülés', 'Banki hitelezési felmérés'],
-    ['2026Q3', 'PROJEKCIÓ_2025_2026', 'SÁRGA - ELŐZETES', 'SÁRGA', 'SÁRGA', 'ZÖLD', 'ZÖLD', 'Hipotetikus likviditási feszültség', 'Érzékenységi vizsgálat'],
-    ['2026Q4', 'PROJEKCIÓ_2025_2026', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'ZÖLD', 'Horizont zárása', 'Hosszú távú felülvizsgálat'],
+  const alertHeaders = [
+    'Negyedév',
+    'Adat_Eredete',
+    'Globális_Állapot',
+    'Adatminőség_Állapot',
+    'Modul_1',
+    'Modul_2',
+    'Modul_3',
+    'Modul_4',
+    'Kiváltó_Jelzések',
+    'Figyelő_Jelzések',
+    'Szűk_Keresztmetszet',
+    'Prioritásos_Intézkedés',
   ];
+  const alertExportRows = generateAlertStateExportRows(quarterlyData);
+  const alertRows = alertExportRows.map((r) => [
+    r.negyedev,
+    r.eredet,
+    r.globalisStatusz,
+    r.adatminosegiAllapot,
+    r.modul1,
+    r.modul2,
+    r.modul3,
+    r.modul4,
+    r.kivaltoJelzesek,
+    r.figyeloJelzesek,
+    r.szukKeresztmetszet,
+    r.prioritasosAkcio,
+  ]);
   const wsAlert = XLSX.utils.aoa_to_sheet([alertHeaders, ...alertRows]);
   XLSX.utils.book_append_sheet(wb, wsAlert, 'Alert_State');
 

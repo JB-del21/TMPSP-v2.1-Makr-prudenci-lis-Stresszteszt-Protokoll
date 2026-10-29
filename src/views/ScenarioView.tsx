@@ -5,6 +5,7 @@
 
 import React, { useState } from 'react';
 import { Activity, AlertTriangle, ShieldAlert, Sparkles, RotateCcw } from 'lucide-react';
+import { calculateScenarioEffects, SCENARIO_UNCALIBRATED_NOTICE } from '../engine/scenarioModel';
 
 export const ScenarioView: React.FC = () => {
   const [incomeShock, setIncomeShock] = useState<number>(-15);
@@ -31,10 +32,13 @@ export const ScenarioView: React.FC = () => {
     }
   };
 
-  // Dinamikus számított hatások
-  const capitalBufferLoss = Math.min(100, Math.max(5, Math.abs(incomeShock) * 1.8 + domShock * 0.35 + Math.abs(priceShock) * 1.2));
-  const guaranteeDrawRate = Math.min(6.5, Math.max(1.8, 1.96 + Math.abs(incomeShock) * 0.05 + bankruptcyShock * 0.012));
-  const expectedState = capitalBufferLoss > 60 ? 'PIROS – Formális Felülvizsgálat' : capitalBufferLoss > 25 ? 'SÁRGA – Előzetes Okfeltárás' : 'ZÖLD – Prudens';
+  // Dinamikus számított hatások a közös modellfüggvényből
+  const { capitalBufferLoss, guaranteeDrawRate, expectedState } = calculateScenarioEffects({
+    incomeShock,
+    domShock,
+    priceShock,
+    bankruptcyShock,
+  });
 
   return (
     <div className="space-y-6">
@@ -42,18 +46,22 @@ export const ScenarioView: React.FC = () => {
       <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <span className="text-xs font-mono font-bold text-blue-400 uppercase">
                 Stress Testing Protocol
               </span>
               <span className="text-slate-600">·</span>
               <span className="text-xs text-slate-400">Nem Előrejelzés, hanem Sokk-Tűrési Teszt</span>
+              <span className="text-slate-600">·</span>
+              <span className="px-2 py-0.5 text-[11px] font-medium bg-amber-950/80 text-amber-300 border border-amber-800/80 rounded-md">
+                {SCENARIO_UNCALIBRATED_NOTICE}
+              </span>
             </div>
-            <h2 className="text-lg font-bold text-white tracking-tight mt-0.5">
+            <h2 className="text-lg font-bold text-white tracking-tight mt-1">
               Makroprudenciális Sokk-Teszt Szimulátor
             </h2>
             <p className="text-xs text-slate-400 mt-1 max-w-2xl leading-relaxed">
-              A TMPSP v2.1 a bankrendszer és a költségvetés ellenállóképességét teszteli kombinált reálgazdasági és ingatlanpiaci sokkok esetén.
+              A TMPSP v2.1 a bankrendszer és a költségvetés ellenállóképességét teszteli kombinált reálgazdasági és ingatlanpiaci sokkok esetén. ({SCENARIO_UNCALIBRATED_NOTICE})
             </p>
           </div>
 
